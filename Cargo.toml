@@ -1,0 +1,16 @@
+[package]
+name = "satus"
+version = "0.1.0"
+edition = "2024"
+
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+[dependencies]
+log = "0.4.29"
+uefi = { version = "0.36.1", features = ["logger", "panic_handler", "alloc", "global_allocator" ] }
+# JJW: TODO: what are the implications of alloc and global_allocator
