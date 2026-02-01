@@ -51,7 +51,8 @@ fn read_keyboard_events(input: &mut Input) -> Result<(),()> {
 }
 
 /// Dump memory map (from rustyboot, but modified to new API)
-fn dump_memory_map() -> Result<(),&'static str> {
+fn determine_kernel_base_address() -> Result<u64,&'static str> {
+    // TODO: actually determine a good base address based on the memory map
     match uefi::boot::memory_map(MemoryType::LOADER_DATA) {
         Ok(mmap) => {
             for desc in mmap.entries() {
@@ -65,9 +66,9 @@ fn dump_memory_map() -> Result<(),&'static str> {
                     ty, phys, virt, pages
                 );
             }
-            Ok(())
+            Ok(0x400000) // Load at 4mb
         }
-        Err(e) => Err("Failed to get memory map"),
+        Err(_) => Err("Failed to get memory map"),
     }
 }
 
@@ -153,13 +154,6 @@ fn main() -> Status {
 
     print_image_path().unwrap();
 
-
-    // Dump memory map
-    info!("\n[uefi] Memory map: ");
-    if let Err(e) = dump_memory_map() {
-        error!("[uefi] Failed to dump memory map: {:?}", e);
-    }
-
     let fs: ScopedProtocol<SimpleFileSystem> = boot::get_image_file_system(boot::image_handle()).unwrap();
     let mut fs = FileSystem::new(fs);
 
@@ -174,10 +168,12 @@ fn main() -> Status {
 
     let elf_binary = elf::Elf64File::new(kernel_buf.as_slice()).unwrap();
 
-    let kernel_base_address = 0x400000;; // Load at 4mb
+    let kernel_base_address = determine_kernel_base_address().unwrap();
     let program_headers = elf_binary.get_program_headers().unwrap();
     info!("Found {} program headers", program_headers.len());
     for (i, ph) in program_headers.iter().enumerate() {
+        // Must copy these out as they're potentially unaligned and rust won't create references to 
+        // unaligned data (even though Intel supports it)
         let ph_type= ph.ph_type;
         let ph_offset = ph.offset;
         let ph_vaddr = ph.virt_address;
