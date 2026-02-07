@@ -73,10 +73,27 @@ impl<'a> Elf64File<'a> {
         }
     }
 
-    pub fn load_segment_to_address(&self, ph: &Elf64ProgramHeader, kernel_base_address: u64) -> Result<(), &'static str> {
+    pub fn get_mem_size(&self) -> usize {
+        let program_headers = self.get_program_headers().unwrap();
+        let mut mem_size = 0usize;
+
+        for ph in program_headers.iter() {
+            if ph.ph_type == PT_LOAD {
+                //let end_addr = ph.virt_address + ph.mem_size;
+                //if end_addr > max_addr {
+                //    max_addr = end_addr;
+                //}
+                mem_size += ph.mem_size as usize;
+            }
+        }
+
+        mem_size
+    }
+
+    pub fn load_segment_to_address(&self, ph: &Elf64ProgramHeader, kernel_base_address: usize) -> Result<(), &'static str> {
         let ph_offset = ph.offset as usize;
         let ph_filesz = ph.file_size as usize;
-        let ph_vaddr = ph.virt_address;
+        let ph_vaddr = ph.virt_address as usize;
 
         if self.raw_data.len() < ph_offset + ph_filesz {
             return Err("Segment data is too small");

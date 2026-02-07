@@ -1,5 +1,5 @@
-#![no_main]
 #![no_std]
+#![cfg_attr(not(test), no_main)]
 
 use core::time::Duration;
 use log::{error, info};
@@ -9,7 +9,6 @@ use uefi::proto::device_path::text::{
     AllowShortcuts, DevicePathToText, DisplayOnly,
 };
 use uefi::proto::loaded_image::LoadedImage;
-//use uefi::{Identify, Result, Error};
 use uefi::Identify; // provides DevicePathToText::GUID
 use uefi::proto::media::fs::SimpleFileSystem;
 use uefi::fs::FileSystem;
@@ -18,11 +17,36 @@ use uefi::{CStr16, cstr16};
 use uefi::mem::memory_map::MemoryMap;
 use uefi::boot::MemoryType;
 use uefi::proto::console::text::{Input, Key, ScanCode};
-//use uefi::{Char16, ResultExt};
 use uefi::Char16;
 use uefi::proto::console::gop::{BltOp, BltPixel};
+use uefi::boot::AllocateType;
+use core::panic::PanicInfo;
 
 mod elf;
+mod module_list;
+
+#[cfg(test)]
+extern crate std;
+
+#[cfg(not(test))]
+#[global_allocator]
+static ALLOCATOR: uefi::allocator::Allocator = uefi::allocator::Allocator;
+
+const PAGE_SIZE: usize = 4096;
+
+/// This function is called on panic.
+#[cfg(not(test))]
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    info!("panic: {}", info.message());
+    if let Some(location) = info.location() {
+        info!("  {}:{}",
+            location.file(),
+            location.line(),
+        );
+    }
+    loop {}
+}
 
 fn read_keyboard_events(input: &mut Input) -> Result<(),()> {
     loop {
@@ -51,8 +75,8 @@ fn read_keyboard_events(input: &mut Input) -> Result<(),()> {
 }
 
 /// Dump memory map (from rustyboot, but modified to new API)
-fn determine_kernel_base_address() -> Result<u64,&'static str> {
-    // TODO: actually determine a good base address based on the memory map
+fn determine_kernel_base_address(size_required: usize) -> Result<usize,&'static str> {
+    /*
     match uefi::boot::memory_map(MemoryType::LOADER_DATA) {
         Ok(mmap) => {
             for desc in mmap.entries() {
@@ -65,11 +89,27 @@ fn determine_kernel_base_address() -> Result<u64,&'static str> {
                     "Type={:?}, phys=0x{:x}, virt=0x{:x}, pages={}",
                     ty, phys, virt, pages
                 );
+                boot::stall(Duration::from_secs(2));
             }
-            Ok(0x400000) // Load at 4mb
+            //Ok(0x400000) // Load at 4mb
+            ()
         }
-        Err(_) => Err("Failed to get memory map"),
+        Err(_) => ()
     }
+    */
+
+    let kernel_pages = (size_required + (PAGE_SIZE-1)) / PAGE_SIZE;
+    let non_null = uefi::boot::allocate_pages(
+        AllocateType::AnyPages,
+        MemoryType::LOADER_DATA,
+        kernel_pages,
+    )
+    .map_err(|_| "Failed to allocate pages")?;
+
+    let raw_ptr: *mut u8 = non_null.as_ptr();
+    let result = raw_ptr as usize;
+
+    Ok(result)
 }
 
 fn print_image_path() -> Result<(),&'static str> {
@@ -166,9 +206,11 @@ fn main() -> Status {
     let kernel_buf = fs.read(kernel_path).unwrap(); // TODO: handle error
     info!("Kernel size: {} bytes", kernel_buf.len());
 
+    // TODO: iterate over the modules directory and load and start each module as well
+
     let elf_binary = elf::Elf64File::new(kernel_buf.as_slice()).unwrap();
 
-    let kernel_base_address = determine_kernel_base_address().unwrap();
+    let kernel_base_address = determine_kernel_base_address(elf_binary.get_mem_size()).unwrap();
     let program_headers = elf_binary.get_program_headers().unwrap();
     info!("Found {} program headers", program_headers.len());
     for (i, ph) in program_headers.iter().enumerate() {
@@ -212,6 +254,23 @@ fn main() -> Status {
 
     //boot::stall(Duration::from_secs(5));
     //gfx_test();
+
+    read_keyboard_events(input_protocol.get_mut().expect("Able to get input protocol"));
+
+    // not sure where the uefi loader maps the text buffer
+    let text_memory = 0xb8000;
+    let vga_buffer: &mut [u8; 4000] = unsafe {
+        core::slice::from_raw_parts_mut(text_memory as *mut u8, 4000)
+            .try_into()
+            .unwrap()
+    };
+    for (i, byte) in vga_buffer.iter_mut().enumerate() {
+        if i % 2 == 0 {
+            *byte = b'X';
+        } else {
+            *byte = 0x07; // Light grey on black background
+        }
+    }
 
     read_keyboard_events(input_protocol.get_mut().expect("Able to get input protocol"));
 
