@@ -1,6 +1,9 @@
 #![no_std]
 #![cfg_attr(not(test), no_main)]
 
+mod elf;
+mod module_list;
+
 use core::time::Duration;
 use log::{error, info};
 use uefi::boot::{self, SearchType};
@@ -13,7 +16,7 @@ use uefi::Identify; // provides DevicePathToText::GUID
 use uefi::proto::media::fs::SimpleFileSystem;
 use uefi::fs::FileSystem;
 use uefi::boot::ScopedProtocol;
-use uefi::{CStr16, cstr16};
+use uefi::{CString16, CStr16, cstr16};
 use uefi::mem::memory_map::MemoryMap;
 use uefi::boot::MemoryType;
 use uefi::proto::console::text::{Input, Key, ScanCode};
@@ -21,9 +24,9 @@ use uefi::Char16;
 use uefi::proto::console::gop::{BltOp, BltPixel};
 use uefi::boot::AllocateType;
 use core::panic::PanicInfo;
+use core::arch::asm;
 
-mod elf;
-mod module_list;
+use module_list::ModuleList;
 
 #[cfg(test)]
 extern crate std;
@@ -34,7 +37,6 @@ static ALLOCATOR: uefi::allocator::Allocator = uefi::allocator::Allocator;
 
 const PAGE_SIZE: usize = 4096;
 
-/// This function is called on panic.
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
@@ -56,10 +58,11 @@ fn read_keyboard_events(input: &mut Input) -> Result<(),()> {
 
         let u_key = Char16::try_from('u').unwrap();
         match input.read_key().discard_errdata().map_err(|_| ())? {
-            // Example of handling a printable key: print a message when
-            // the 'u' key is pressed.
-            Some(Key::Printable(key)) if key == u_key => {
-                info!("the 'u' key was pressed");
+
+            Some(Key::Printable(key)) => {
+                let char_value: char = key.into();
+                
+                info!("Key {} pressed", char_value);
             }
 
             // Example of handling a special key: exit the loop when the
@@ -75,29 +78,7 @@ fn read_keyboard_events(input: &mut Input) -> Result<(),()> {
 }
 
 /// Dump memory map (from rustyboot, but modified to new API)
-fn determine_kernel_base_address(size_required: usize) -> Result<usize,&'static str> {
-    /*
-    match uefi::boot::memory_map(MemoryType::LOADER_DATA) {
-        Ok(mmap) => {
-            for desc in mmap.entries() {
-                let ty = desc.ty;
-                let phys = desc.phys_start;
-                let virt = desc.virt_start; // this is always 0? why?
-                let pages = desc.page_count;
-                //let size_bytes = (pages as usize) * 4096;
-                info!(
-                    "Type={:?}, phys=0x{:x}, virt=0x{:x}, pages={}",
-                    ty, phys, virt, pages
-                );
-                boot::stall(Duration::from_secs(2));
-            }
-            //Ok(0x400000) // Load at 4mb
-            ()
-        }
-        Err(_) => ()
-    }
-    */
-
+fn allocate_buffer(size_required: usize) -> Result<usize,&'static str> {
     let kernel_pages = (size_required + (PAGE_SIZE-1)) / PAGE_SIZE;
     let non_null = uefi::boot::allocate_pages(
         AllocateType::AnyPages,
@@ -108,6 +89,8 @@ fn determine_kernel_base_address(size_required: usize) -> Result<usize,&'static 
 
     let raw_ptr: *mut u8 = non_null.as_ptr();
     let result = raw_ptr as usize;
+
+    info!("Allocated {} pages ({} bytes) at address 0x{:x}", kernel_pages, kernel_pages * PAGE_SIZE, result);
 
     Ok(result)
 }
@@ -182,6 +165,31 @@ fn gfx_test() {
     // TODO: display a loading animation
 }
 
+fn load_modules(mut fs: uefi::fs::FileSystem, module_list: &mut module_list::ModuleList) {
+    // Iterate all the modules and load them, and save them to the list
+    let path = cstr16!("\\efi\\boot\\modules");
+    if let Ok(dir_listing) = fs.read_dir(path) {
+        info!("Loading modules from {}", path);
+        for file in dir_listing {
+            let file_info = file.as_ref().unwrap(); // do we need as_ref) here?
+            if file_info.is_regular_file() {
+                let mut full_name = CString16::try_from(path).unwrap();
+                full_name.push_str(cstr16!("\\"));
+                full_name.push_str(file_info.file_name());
+                info!("Loading module from path: {}", full_name);
+                
+                let module_buf = fs.read(full_name.as_ref()).unwrap();
+                info!("Module size: {} bytes", module_buf.len());
+                let elf_module = elf::Elf64File::new(module_buf.as_slice()).unwrap();
+                let module_base_address = allocate_buffer(elf_module.get_mem_size()).unwrap();
+                elf_module.load_to_address(module_base_address).unwrap();
+                // TODO: we need the entry point...
+                module_list.append(file_info.file_name(), module_base_address, elf_module.get_mem_size(), 0).unwrap();
+            }
+        }
+    }
+}
+
 
 #[entry]
 fn main() -> Status {
@@ -197,90 +205,34 @@ fn main() -> Status {
     let fs: ScopedProtocol<SimpleFileSystem> = boot::get_image_file_system(boot::image_handle()).unwrap();
     let mut fs = FileSystem::new(fs);
 
-    let path = cstr16!("\\");
-    for file in fs.read_dir(path).unwrap() {
-        info!("Found {}", file.unwrap().file_name())        
-    }
-
     let kernel_path = cstr16!("\\efi\\boot\\kernel.elf");
     let kernel_buf = fs.read(kernel_path).unwrap(); // TODO: handle error
-    info!("Kernel size: {} bytes", kernel_buf.len());
-
-    // TODO: iterate over the modules directory and load and start each module as well
-
     let elf_binary = elf::Elf64File::new(kernel_buf.as_slice()).unwrap();
 
-    let kernel_base_address = determine_kernel_base_address(elf_binary.get_mem_size()).unwrap();
-    let program_headers = elf_binary.get_program_headers().unwrap();
-    info!("Found {} program headers", program_headers.len());
-    for (i, ph) in program_headers.iter().enumerate() {
-        // Must copy these out as they're potentially unaligned and rust won't create references to 
-        // unaligned data (even though Intel supports it)
-        let ph_type= ph.ph_type;
-        let ph_offset = ph.offset;
-        let ph_vaddr = ph.virt_address;
-        let ph_paddr = ph.phys_address;
-        let ph_filesz = ph.file_size;
-        let ph_memsz = ph.mem_size;
-        let ph_flags = ph.flags;
-        let ph_align = ph.align;
-        info!(
-            "Program Header {}: type=0x{:x}, offset=0x{:x}, vaddr=0x{:x}, paddr=0x{:x}, filesz=0x{:x}, memsz=0x{:x}, flags=0x{:x}, align=0x{:x}",
-            i,
-            ph_type,
-            ph_offset,
-            ph_vaddr,
-            ph_paddr,
-            ph_filesz,
-            ph_memsz,
-            ph_flags,
-            ph_align
+    info!("Kernel read size: {} bytes, mem size: {} bytes", kernel_buf.len(), elf_binary.get_mem_size());
+
+    let kernel_base_address = allocate_buffer(elf_binary.get_mem_size()).unwrap();
+    elf_binary.load_to_address(kernel_base_address).unwrap();
+
+    info!("Loading modules...");
+    let mut module_list = ModuleList::new().unwrap();
+    load_modules(fs, &mut module_list);
+    info!("Read {} modules", module_list.get_num_modules());
+
+    info!("Press esc key to load kernel...");
+    read_keyboard_events(input_protocol.get_mut().expect("Able to get input protocol"));
+
+    let entry_point = elf_binary.get_header().unwrap().get_entry_point() + kernel_base_address;
+    unsafe {
+        let kernel: extern "sysv64" fn() -> ! = core::mem::transmute(entry_point as *const ());
+        let mmap = uefi::boot::exit_boot_services(None);
+        asm!(
+            "mov rax, {val}",
+            val = in(reg) module_list.get_page_ptr(),
         );
 
-        match ph_type {
-            elf::PT_LOAD => {
-                info!("  -> This is a loadable segment copying to {} + 0x{:x}", kernel_base_address, ph_vaddr);
-                elf_binary.load_segment_to_address(
-                    ph,
-                    kernel_base_address
-                ).unwrap();
-                //info!("  -> Segment loaded to address 0x{:x}", kernel_base_address + ph_vaddr);
-            }
-            _ => {
-                info!("  -> This segment type is not handled");
-            }
-        }
+        kernel();
     }
-
-    //boot::stall(Duration::from_secs(5));
-    //gfx_test();
-
-    read_keyboard_events(input_protocol.get_mut().expect("Able to get input protocol"));
-
-    // not sure where the uefi loader maps the text buffer
-    let text_memory = 0xb8000;
-    let vga_buffer: &mut [u8; 4000] = unsafe {
-        core::slice::from_raw_parts_mut(text_memory as *mut u8, 4000)
-            .try_into()
-            .unwrap()
-    };
-    for (i, byte) in vga_buffer.iter_mut().enumerate() {
-        if i % 2 == 0 {
-            *byte = b'X';
-        } else {
-            *byte = 0x07; // Light grey on black background
-        }
-    }
-
-    read_keyboard_events(input_protocol.get_mut().expect("Able to get input protocol"));
-
-    // read file into buffer
-    // transmute buffer into Elf64Header
-    // verify header fields
-    // load program segments into memory (ideally mapped to 0xFFFFFFFF80000000)
-    // exit boot services?
-    // set up virtual memory mapping?
-    // jump to entry point
 
     Status::SUCCESS
 }

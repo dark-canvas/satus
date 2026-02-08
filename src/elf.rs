@@ -2,6 +2,7 @@
 // https://wiki.osdev.org/ELF
 
 use uefi::prelude::*;
+use log::info;
 
 pub struct Elf64File<'a> {
     raw_data: &'a [u8],
@@ -75,20 +76,43 @@ impl<'a> Elf64File<'a> {
 
     pub fn get_mem_size(&self) -> usize {
         let program_headers = self.get_program_headers().unwrap();
-        let mut mem_size = 0usize;
+        let mut max_addr = 0u64;
 
         for ph in program_headers.iter() {
             if ph.ph_type == PT_LOAD {
-                //let end_addr = ph.virt_address + ph.mem_size;
-                //if end_addr > max_addr {
-                //    max_addr = end_addr;
-                //}
-                mem_size += ph.mem_size as usize;
+                let end_addr = ph.virt_address + ph.mem_size;
+                if end_addr > max_addr {
+                    max_addr = end_addr;
+                }
             }
         }
 
-        mem_size
+        max_addr as usize
     }
+
+    pub fn load_to_address(&self, kernel_base_address: usize) -> Result<(), &'static str> {
+        let program_headers = self.get_program_headers().unwrap();
+        for (i, ph) in program_headers.iter().enumerate() {
+            // Must copy these out as they're potentially unaligned and rust won't create references to 
+            // unaligned data (even though Intel supports it)
+            let ph_type= ph.ph_type;
+            let ph_vaddr = ph.virt_address;
+
+            match ph_type {
+                PT_LOAD => {
+                    info!("  -> This is a loadable segment copying to {} + 0x{:x}", kernel_base_address, ph_vaddr);
+                    self.load_segment_to_address(
+                        ph,
+                        kernel_base_address
+                    ).unwrap();
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+
 
     pub fn load_segment_to_address(&self, ph: &Elf64ProgramHeader, kernel_base_address: usize) -> Result<(), &'static str> {
         let ph_offset = ph.offset as usize;
@@ -144,6 +168,12 @@ pub struct Elf64Header {
     pub sh_entry_size: u16,    /* Size of section header entry */
     pub sh_num: u16,          /* Number of section header entries */
     pub sh_string_index: u16,     /* Section name string table index */
+}
+
+impl Elf64Header {
+    pub fn get_entry_point(&self) -> usize {
+        self.entry as usize
+    }
 }
 
 pub const ELF_MAGIC: [u8; 4] = [0x7F, b'E', b'L', b'F'];
