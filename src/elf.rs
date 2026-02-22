@@ -100,7 +100,7 @@ impl<'a> Elf64File<'a> {
 
             match ph_type {
                 PT_LOAD => {
-                    info!("  -> This is a loadable segment copying to {} + 0x{:x}", kernel_base_address, ph_vaddr);
+                    info!("  -> This is a loadable segment copying to 0x{:x} + 0x{:x}", kernel_base_address, ph_vaddr);
                     self.load_segment_to_address(
                         ph,
                         kernel_base_address
@@ -128,6 +128,7 @@ impl<'a> Elf64File<'a> {
 
         unsafe {
             let dest_ptr = dest_addr as *mut u8;
+            info!("    copying {:x} to {:x} ({} bytes)", segment_data.as_ptr() as usize, dest_ptr as usize, segment_data.len());
             core::ptr::copy_nonoverlapping(segment_data.as_ptr(), dest_ptr, segment_data.len());
 
             // zero out the remaining memory if mem_size > file_size
@@ -135,7 +136,15 @@ impl<'a> Elf64File<'a> {
             if ph_memsz > ph_filesz {
                 let zero_start = dest_ptr.add(ph_filesz);
                 let zero_size = ph_memsz - ph_filesz;
+                info!("    zeroing {:x} ({} bytes)", zero_start as usize, zero_size);
                 core::ptr::write_bytes(zero_start, 0, zero_size);
+            }
+
+            // debug... dump out the first 16 bytes of the loaded segment
+            info!("      First 8 bytes of loaded segment:");
+            for i in 0..8 {
+                let byte = *dest_ptr.add(i);
+                info!("    {:02x}", byte);
             }
         }
 
