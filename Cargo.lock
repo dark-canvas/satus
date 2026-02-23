@@ -81,9 +81,15 @@ name = "satus"
 version = "0.1.0"
 dependencies = [
  "log",
+ "satus-struct",
  "uefi",
  "x86_64",
 ]
+
+[[package]]
+name = "satus-struct"
+version = "0.1.0"
+source = "git+https://github.com/dark-canvas/satus-struct#e23bc63b117b18d18fb0b49c19123ba3024c7e03"
 
 [[package]]
 name = "syn"

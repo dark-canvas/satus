@@ -1,10 +1,12 @@
 #![no_std]
 #![cfg_attr(not(test), no_main)]
 
-mod config;
 mod elf;
-mod module_list;
 mod pager;
+
+extern crate satus_struct;
+use satus_struct::config::Config;
+use satus_struct::module_list::ModuleList;
 
 use core::time::Duration;
 use log::{error, info};
@@ -23,14 +25,11 @@ use uefi::mem::memory_map::MemoryMap;
 use uefi::boot::MemoryType;
 use uefi::proto::console::text::{Input, Key, ScanCode};
 use uefi::Char16;
-use uefi::proto::console::gop::{BltOp, BltPixel};
+use uefi::proto::console::gop::{BltOp, BltPixel, PixelFormat, GraphicsOutput};
 use uefi::boot::AllocateType;
 use core::panic::PanicInfo;
 use core::arch::asm;
 
-
-
-use module_list::ModuleList;
 use pager::Pager;
 
 #[cfg(test)]
@@ -83,18 +82,21 @@ fn read_keyboard_events(input: &mut Input) -> Result<(),()> {
     Ok(())
 }
 
-/// Dump memory map (from rustyboot, but modified to new API)
-fn allocate_buffer(size_required: usize) -> Result<usize,&'static str> {
-    let kernel_pages = (size_required + (PAGE_SIZE-1)) / PAGE_SIZE;
+fn get_pages(num: usize) -> Result<usize, &'static str> {
     let non_null = uefi::boot::allocate_pages(
         AllocateType::AnyPages,
         MemoryType::LOADER_DATA,
-        kernel_pages,
+        num,
     )
     .map_err(|_| "Failed to allocate pages")?;
 
-    let raw_ptr: *mut u8 = non_null.as_ptr();
-    let result = raw_ptr as usize;
+    Ok(non_null.as_ptr() as usize)
+}
+
+/// Dump memory map (from rustyboot, but modified to new API)
+fn allocate_buffer(size_required: usize) -> Result<usize,&'static str> {
+    let kernel_pages = (size_required + (PAGE_SIZE-1)) / PAGE_SIZE;
+    let result = get_pages(kernel_pages)?;
 
     info!("Allocated {} pages ({} bytes) at address 0x{:x}", kernel_pages, kernel_pages * PAGE_SIZE, result);
 
@@ -182,7 +184,7 @@ fn gfx_test() {
     // TODO: display a loading animation
 }
 
-fn load_modules(mut fs: uefi::fs::FileSystem, module_list: &mut module_list::ModuleList) {
+fn load_modules(mut fs: uefi::fs::FileSystem, module_list: &mut ModuleList) {
     // Iterate all the modules and load them, and save them to the list
     let path = cstr16!("\\efi\\boot\\modules");
     if let Ok(dir_listing) = fs.read_dir(path) {
@@ -201,7 +203,7 @@ fn load_modules(mut fs: uefi::fs::FileSystem, module_list: &mut module_list::Mod
                 let module_base_address = allocate_buffer(elf_module.get_mem_size()).unwrap();
                 elf_module.load_to_address(module_base_address).unwrap();
                 // TODO: we need the entry point...
-                module_list.append(file_info.file_name(), module_base_address, elf_module.get_mem_size(), 0).unwrap();
+                module_list.append(file_info.file_name().as_bytes(), module_base_address, elf_module.get_mem_size(), 0).unwrap();
             }
         }
     }
@@ -226,6 +228,37 @@ fn dump_memory_map() -> Result<(),&'static str> {
         }
         Err(e) => Err("Failed to get memory map"),
     }
+}
+
+pub fn set_framebuffer(config: &mut Config, gop: &mut ScopedProtocol<GraphicsOutput>) {
+    let mode_info = gop.current_mode_info();
+    let (width, height) = mode_info.resolution();
+    let (red_mask, green_mask, blue_mask) = match mode_info.pixel_format() {
+        PixelFormat::Rgb => (0x00FF0000, 0x0000FF00, 0x000000FF),
+        PixelFormat::Bgr => (0x000000FF, 0x0000FF00, 0x00FF0000),
+        PixelFormat::Bitmask => {
+            let pixel_mask = mode_info.pixel_bitmask().expect("Pixel format is bitmask but no bitmask provided");
+            (
+                pixel_mask.red,
+                pixel_mask.green,
+                pixel_mask.blue
+            )
+        },
+        PixelFormat::BltOnly => {
+            panic!("Unsupported pixel format: BltOnly");
+        }
+    };
+    config.set_framebuffer(
+        gop.frame_buffer().as_mut_ptr() as usize,
+        gop.frame_buffer().size() as u32);
+    config.set_framebuffer_dimensions(
+        width as u16, 
+        height as u16,
+        mode_info.stride() as u32);
+    config.set_framebuffer_color_masks(
+        red_mask, 
+        green_mask, 
+        blue_mask);
 }
 
 #[entry]
@@ -253,7 +286,7 @@ fn main() -> Status {
     elf_binary.load_to_address(kernel_base_address).unwrap();
 
     info!("Loading modules...");
-    let mut module_list = ModuleList::new().unwrap();
+    let mut module_list = ModuleList::new_from_page( get_pages(1).unwrap() ).unwrap();
     load_modules(fs, &mut module_list);
     info!("Read {} modules", module_list.get_num_modules());
 
@@ -277,9 +310,9 @@ fn main() -> Status {
     let mut gop = 
         boot::open_protocol_exclusive::<GraphicsOutput>(gop_handle).unwrap();
 
-    let mut config = config::Config::new().unwrap();
+    let mut config = Config::new_from_page( get_pages(1).unwrap() ).unwrap();
     config.set_module_list(module_list.get_page_ptr());
-    config.set_framebuffer(&mut gop);
+    set_framebuffer(&mut config, &mut gop);
 
     let entry_point = elf_binary.get_header().unwrap().get_entry_point() + kernel_base_address;
     info!("Kernel entry point: 0x{:x} == 0x{:x} + 0x{:x}", 
