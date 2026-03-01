@@ -32,7 +32,7 @@ impl<'a> Elf64File<'a> {
         }
 
         // Verify type
-        if header.exe_type != ELF_TYPE_PIE_EXECUTABLE {
+        if header.exe_type != ELF_TYPE_PIE_EXECUTABLE && header.exe_type != ELF_TYPE_EXECUTABLE {
             return Err("Not an executable ELF");
         }
 

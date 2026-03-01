@@ -1,6 +1,7 @@
 #![no_std]
 #![cfg_attr(not(test), no_main)]
 
+
 mod elf;
 mod pager;
 
@@ -285,8 +286,12 @@ fn main() -> Status {
     let kernel_base_address = allocate_buffer(elf_binary.get_mem_size()).unwrap();
     elf_binary.load_to_address(kernel_base_address).unwrap();
 
-    info!("Loading modules...");
+    // first module in the module list is the kernel itself
+    let kernel_name = cstr16!("kernel");
     let mut module_list = ModuleList::new_from_page( get_pages(1).unwrap() ).unwrap();
+    module_list.append(kernel_name.as_bytes(), kernel_base_address, elf_binary.get_mem_size(), 0).unwrap();
+
+    info!("Loading modules...");
     load_modules(fs, &mut module_list);
     info!("Read {} modules", module_list.get_num_modules());
 
