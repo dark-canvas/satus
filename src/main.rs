@@ -405,10 +405,10 @@ fn main() -> Status {
     unsafe {
         // dump the first 8 bytes of the kernel entry point for debugging
         let entry_ptr = entry_point as *const u8;
-        info!("MEM First 8 bytes of kernel entry point:");
+        info!("First 8 bytes of kernel entry point:");
         for i in 0..8 {
             let byte = *entry_ptr.add(i);
-            info!("MEM {:x}:  {:02x}", entry_ptr.add(i) as usize, byte);
+            info!("  {:x}:  {:02x}", entry_ptr.add(i) as usize, byte);
         }
         let mmap = uefi::boot::exit_boot_services(None);
 

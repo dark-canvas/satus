@@ -138,7 +138,7 @@ impl<'a> Elf64File<'a> {
             let ph_align = ph.align;
 
             info!(
-                "MEM Program Header {}: type {}, offset 0x{:x}, vaddr 0x{:x}, paddr 0x{:x}, filesz 0x{:x}, memsz 0x{:x}, align 0x{:x}",
+                "Program Header {}: type {}, offset 0x{:x}, vaddr 0x{:x}, paddr 0x{:x}, filesz 0x{:x}, memsz 0x{:x}, align 0x{:x}",
                 i, ph_type, ph_offset, ph_vaddr, ph_paddr, ph_filesz, ph_memsz, ph_align);
 
             match ph_type {
@@ -166,7 +166,7 @@ impl<'a> Elf64File<'a> {
             return Err("Segment data is too small");
         }
 
-        info!("MEM      size {:x} vma {:x} file off {:x}",
+        info!("      size {:x} vma {:x} file off {:x}",
             ph_filesz, ph_vaddr, ph_offset);
 
         let segment_data = &self.raw_data[ph_offset..ph_offset + ph_filesz];
@@ -174,7 +174,7 @@ impl<'a> Elf64File<'a> {
 
         unsafe {
             let dest_ptr = dest_addr as *mut u8;
-            info!("MEM    copying {:x} to {:x} ({} bytes)", segment_data.as_ptr() as usize, dest_ptr as usize, segment_data.len());
+            info!("    copying {:x} to {:x} ({} bytes)", segment_data.as_ptr() as usize, dest_ptr as usize, segment_data.len());
             core::ptr::copy_nonoverlapping(segment_data.as_ptr(), dest_ptr, segment_data.len());
 
             // zero out the remaining memory if mem_size > file_size
@@ -182,15 +182,15 @@ impl<'a> Elf64File<'a> {
             if ph_memsz > ph_filesz {
                 let zero_start = dest_ptr.add(ph_filesz);
                 let zero_size = ph_memsz - ph_filesz;
-                info!("MEM    zeroing {:x} ({} bytes)", zero_start as usize, zero_size);
+                info!("    zeroing {:x} ({} bytes)", zero_start as usize, zero_size);
                 core::ptr::write_bytes(zero_start, 0, zero_size);
             }
 
             // debug... dump out the first 16 bytes of the loaded segment
-            info!("MEM      First 8 bytes of loaded segment:");
+            info!("      First 8 bytes of loaded segment:");
             for i in 0..8 {
                 let byte = *dest_ptr.add(i);
-                info!("MEM      {:x}:    {:02x}", dest_ptr.add(i) as usize, byte);
+                info!("      {:x}:    {:02x}", dest_ptr.add(i) as usize, byte);
             }
         }
 
