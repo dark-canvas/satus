@@ -120,7 +120,11 @@ impl<'a> Elf64File<'a> {
         min_virtual.unwrap_or(0) as usize
     }
 
-    pub fn load_to_address(&self, kernel_base_address: usize) -> Result<(), &'static str> {
+    pub fn relocate(&self) -> Result<(), &'static str> {
+        self.relocate_to(0)
+    }
+
+    pub fn relocate_to(&self, kernel_base_address: usize) -> Result<(), &'static str> {
         let program_headers = self.get_program_headers().unwrap();
         for (i, ph) in program_headers.iter().enumerate() {
             // Must copy these out as they're potentially unaligned and rust won't create references to 
@@ -148,8 +152,6 @@ impl<'a> Elf64File<'a> {
                 _ => {}
             }
         }
-
-        //dump_memory(kernel_base_address, self.get_mem_size());
 
         Ok(())
     }
