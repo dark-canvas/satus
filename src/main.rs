@@ -1,7 +1,14 @@
+//! Satus UEFI bootloader
+//!
+//! This is a simple UEFI bootloader which is designed to load an ELF binary (the kernel) into 
+//! the upper portion of virtual memory, and then jump to its entry point.
+//! The loader can also load additional ELF modules from a predefined directory on disk, and 
+//! pass a pointer to the list of loaded modules to the kernel via a config struct in memory.
+
 #![no_std]
 #![cfg_attr(not(test), no_main)]
 
-
+mod types;
 mod elf;
 mod pager;
 
@@ -31,10 +38,15 @@ use uefi::boot::AllocateType;
 use core::panic::PanicInfo;
 use core::arch::asm;
 
-use pager::Pager;
+use x86_64::registers::control::Cr3;
+//use x86_64::structures::paging::Size4KiB;
+
+use pager::{Pager, bytes_to_pages};
 
 #[cfg(test)]
 extern crate std;
+
+//use volatile::Volatile;
 
 #[cfg(not(test))]
 #[global_allocator]
@@ -84,6 +96,7 @@ fn read_keyboard_events(input: &mut Input) -> Result<(),()> {
 }
 
 fn get_pages(num: usize) -> Result<usize, &'static str> {
+    info!("Requesting {} pages ({} bytes)", num, num * PAGE_SIZE);
     let non_null = uefi::boot::allocate_pages(
         AllocateType::AnyPages,
         MemoryType::LOADER_DATA,
@@ -231,6 +244,29 @@ fn dump_memory_map() -> Result<(),&'static str> {
     }
 }
 
+fn get_total_pages() -> u64 {
+    // Allocate buffer for memory map
+    //let mmap_storage = bt
+    //    .memory_map(MemoryMapOwned::new())
+    //    .expect("Failed to get memory map");
+    let mmap_storage = uefi::boot::memory_map(MemoryType::LOADER_DATA)
+        .expect("Failed to get memory map");
+
+    let mut total_pages = 0;
+    let mut total_conventional = 0;
+    for desc in mmap_storage.entries() {
+        if desc.ty == MemoryType::CONVENTIONAL {
+            total_conventional += desc.page_count;
+        }
+        total_pages += desc.page_count;
+    }
+
+    info!("Total pages: {}, Total conventional pages: {}", total_pages, total_conventional);
+
+
+    total_pages
+}
+
 pub fn set_framebuffer(config: &mut Config, gop: &mut ScopedProtocol<GraphicsOutput>) {
     let mode_info = gop.current_mode_info();
     let (width, height) = mode_info.resolution();
@@ -262,9 +298,44 @@ pub fn set_framebuffer(config: &mut Config, gop: &mut ScopedProtocol<GraphicsOut
         blue_mask);
 }
 
+fn dump_memory(base_address: usize, mem_size: usize) {
+    info!("Dumping memory at address 0x{:x}, size 0x{:x}", base_address, mem_size);
+
+    unsafe {
+        let ptr = base_address as *const u8;
+        for row in 0..(mem_size/16) {
+            let i = row * 16;
+            let byte0: u8 = *ptr.add(i);
+            let byte1: u8 = *ptr.add(i+1);
+            let byte2: u8 = *ptr.add(i+2);
+            let byte3: u8 = *ptr.add(i+3);
+            let byte4: u8 = *ptr.add(i+4);
+            let byte5: u8 = *ptr.add(i+5);
+            let byte6: u8 = *ptr.add(i+6);
+            let byte7: u8 = *ptr.add(i+7);
+            let byte8: u8 = *ptr.add(i+8);
+            let byte9: u8 = *ptr.add(i+9);
+            let byte10: u8 = *ptr.add(i+10);
+            let byte11: u8 = *ptr.add(i+11);
+            let byte12: u8 = *ptr.add(i+12);
+            let byte13: u8 = *ptr.add(i+13);
+            let byte14: u8 = *ptr.add(i+14);
+            let byte15: u8 = *ptr.add(i+15);
+
+            info!("{:x}  : {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}    {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}", 
+            base_address + i,
+            byte0, byte1, byte2,  byte3,  byte4,  byte5,  byte6,  byte7, 
+            byte8, byte9, byte10, byte11, byte12, byte13, byte14, byte15);  
+        }
+     }
+}
+
 #[entry]
 fn main() -> Status {
     uefi::helpers::init().unwrap();
+
+    let address_of_main = main as *const ();
+    info!("Address of main: 0x{:x}", address_of_main as usize);
 
     let handle = 
         boot::get_handle_for_protocol::<Input>().expect("Can get input");
@@ -277,25 +348,79 @@ fn main() -> Status {
     let mut fs = FileSystem::new(fs);
 
     let kernel_path = cstr16!("\\efi\\boot\\kernel.elf");
+    //let kernel_metadata = fs.metadata(kernel_path).expect("Failed to read kernel metadata");
+    //let kernel_size = kernel_metadata.file_size() as usize;
+    //info!("MEM kernel size on disk: {} bytes", kernel_size);
+    
+    //let kernel_pages = (kernel_size + (PAGE_SIZE-1)) / PAGE_SIZE;
+    //let kernel_buf_allocated = get_pages(kernel_pages).expect("Failed to allocate pages for kernel");
+
     let kernel_buf = fs.read(kernel_path).unwrap(); // TODO: handle error
     let elf_binary = elf::Elf64File::new(kernel_buf.as_slice()).unwrap();
 
-    info!("Kernel read to 0x{:x} size: {} bytes, mem size: {} bytes", 
+    info!("Kernel file contents read to 0x{:x} size: {} bytes, mem size: {} bytes", 
         kernel_buf.as_ptr() as usize, kernel_buf.len(), elf_binary.get_mem_size());
+    info!("MEM [ KERNEL FILE      ] 0x{:x} - 0x{:x} ({} bytes)", 
+        kernel_buf.as_ptr() as usize, 
+        (kernel_buf.as_ptr() as usize) + kernel_buf.len(), 
+        kernel_buf.len());
 
-    let kernel_base_address = allocate_buffer(elf_binary.get_mem_size()).unwrap();
-    elf_binary.load_to_address(kernel_base_address).unwrap();
+    let mut pager = Pager::new(|| { get_pages(1).map_err(|_| "pager: failed to allocate page") });
+
+    let pml4_addr = pml4_frame.start_address().as_u64();
+    let pml4_phys = pager.virtual_to_physical(pml4_addr as usize).unwrap_or(0);
+    info!("CR3 points to PML4 at virtual address 0x{:x}, physical address 0x{:x}", pml4_addr, pml4_phys);
+
+    let phys = pager.virtual_to_physical(elem0 as usize).unwrap_or(0);
+    info!("PML4[0] points to physical address 0x{:x}", phys);
+
+    //pager.output_mmap();
+    /*
+    info!("MEM [ KERNEL FILE ALLOC ] 0x{:x} - 0x{:x} ({} bytes)", 
+        kernel_buf_allocated, 
+        kernel_buf_allocated + (kernel_pages * PAGE_SIZE),
+        kernel_pages * PAGE_SIZE);
+    */
+    // TODO:
+    let kernel_size_bytes = elf_binary.get_mem_size();
+    let kernel_size_pages = bytes_to_pages(kernel_size_bytes);
+    let kernel_virt_base = elf_binary.get_virtual_address();
+    info!("Kernel is {} bytes ({} pages) at virtual address 0x{:x}", 
+        kernel_size_bytes, kernel_size_pages, kernel_virt_base);
+    //pager.allocate_and_map(kernel_virt_base, elf_binary.get_mem_size()).expect("Failed to allocate and map kernel memory");
+    // or something like this?
+    // pager takes an iterator of physical pages?
+    // use co-routines?  Essentially pass in an iterator which allocates pages 
+    // on demand, and yields the physical address back to the pager, which then 
+    // sets up the mapping, and continues until all pages are mapped.  
+    //let kernel_base_address = pager.map(addr, alloc_pages(n))
+    
+    // technically, because memory is iddentity mapped, this is also mapped 
+    // into the virtual space at the same address...
+    let kernel_phys_address = allocate_buffer(kernel_size_bytes).unwrap();
+    pager.map_to_virtual_many(kernel_virt_base, kernel_phys_address, kernel_size_pages, 
+        x86_64::structures::paging::PageTableFlags::WRITABLE).expect("Failed to map kernel memory");
+
+    // TODO: remove (replace with kerenl_virt_base)
+    let kernel_base_address = kernel_virt_base;
+    info!("MEM Relocating kernel to address 0x{:x} - 0x{:x}", 
+        kernel_base_address, 
+        kernel_base_address + elf_binary.get_mem_size());
+    elf_binary.load_to_address(/*kernel_base_address*/0).unwrap();
+    info!("MEM [ KERNEL RELOCATED ] 0x{:x} - 0x{:x} ({} bytes)", 
+        kernel_base_address, 
+        kernel_base_address + elf_binary.get_mem_size(),
+        elf_binary.get_mem_size());
 
     // first module in the module list is the kernel itself
     let kernel_name = cstr16!("kernel");
     let mut module_list = ModuleList::new_from_page( get_pages(1).unwrap() ).unwrap();
-    module_list.append(kernel_name.as_bytes(), kernel_base_address, elf_binary.get_mem_size(), 0).unwrap();
+    module_list.append(kernel_name.as_bytes(), kernel_base_address, kernel_size_bytes, 0).unwrap();
 
     info!("Loading modules...");
     load_modules(fs, &mut module_list);
     info!("Read {} modules", module_list.get_num_modules());
 
-    let pager = Pager::new();
     let virtual_addr = 0xb80000; // VGA text buffer
     if let Some(phys_addr) = pager.virtual_to_physical(virtual_addr) {
         info!("virtual address 0x{:x} maps to physical address 0x{:x}", virtual_addr, phys_addr);
@@ -303,12 +428,18 @@ fn main() -> Status {
         error!("Failed to translate kernel virtual address");
     }
 
+    info!("To debug with gdb:");
+    info!("target remote localhost:1234");
+    info!("add-symbol-table esp/efi/boot/kernel.elf 0x{:x}\n", kernel_base_address);
+
     info!("Press esc key to load kernel...");
     read_keyboard_events(input_protocol.get_mut().expect("Able to get input protocol"));
 
-    dump_memory_map().unwrap();
+    //dump_memory_map().unwrap();
+    //let total_pages = get_total_pages();
+    //let pager_total_pages = pager.count_pages();
+    //info!("Total pages available from API {} from pager {}", total_pages, pager_total_pages);
 
-    //gfx_test();
     use uefi::proto::console::gop::{GraphicsOutput, PixelFormat};
     let gop_handle = 
         boot::get_handle_for_protocol::<GraphicsOutput>().expect("Can get GOP handle");
@@ -319,16 +450,17 @@ fn main() -> Status {
     config.set_module_list(module_list.get_page_ptr());
     set_framebuffer(&mut config, &mut gop);
 
-    let entry_point = elf_binary.get_header().unwrap().get_entry_point() + kernel_base_address;
-    info!("Kernel entry point: 0x{:x} == 0x{:x} + 0x{:x}", 
+    //dump_memory(kernel_base_address, elf_binary.get_mem_size());
+    let entry_point = elf_binary.get_header().unwrap().get_entry_point();// + kernel_base_address;
+    info!("MEM Kernel entry point: 0x{:x} == 0x{:x} + 0x{:x}", 
         entry_point, kernel_base_address, elf_binary.get_header().unwrap().get_entry_point());
     unsafe {
         // dump the first 8 bytes of the kernel entry point for debugging
         let entry_ptr = entry_point as *const u8;
-        info!("First 8 bytes of kernel entry point:");
+        info!("MEM First 8 bytes of kernel entry point:");
         for i in 0..8 {
             let byte = *entry_ptr.add(i);
-            info!("  {:02x}", byte);
+            info!("MEM {:x}:  {:02x}", entry_ptr.add(i) as usize, byte);
         }
         let mmap = uefi::boot::exit_boot_services(None);
 

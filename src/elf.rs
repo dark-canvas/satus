@@ -1,5 +1,13 @@
-// https://en.wikipedia.org/wiki/Executable_and_Linkable_Format
-// https://wiki.osdev.org/ELF
+//! A simple ELF binary loader
+//!
+//! This providers only enough functionality to read in an ELF file, verify it, and load it into memory.
+//! It does not support any dynamic linking, relocation, or other features of the ELF format. 
+//! It is assumed that the ELF binary is 64-bit (x64-64), little-endian, and has been configured with the 
+//! proper linear address for loading into the upper half of the address space.
+//!
+//! See also:
+//!  - https://en.wikipedia.org/wiki/Executable_and_Linkable_Format
+//!  - https://wiki.osdev.org/ELF
 
 use uefi::prelude::*;
 use log::info;
@@ -41,6 +49,10 @@ impl<'a> Elf64File<'a> {
             return Err("Not x86_64 ELF");
         }
 
+        let entry_size = header.ph_entry_size as usize;
+        let num_entries = header.ph_num as usize;
+        info!("ph entry size {}, num {} struct size {}", entry_size, num_entries, size_of::<Elf64ProgramHeader>());
+
         Ok(result)
     }
 
@@ -77,6 +89,7 @@ impl<'a> Elf64File<'a> {
     pub fn get_mem_size(&self) -> usize {
         let program_headers = self.get_program_headers().unwrap();
         let mut max_addr = 0u64;
+        let mut min_addr = u64::MAX as u64;
 
         for ph in program_headers.iter() {
             if ph.ph_type == PT_LOAD {
@@ -84,10 +97,27 @@ impl<'a> Elf64File<'a> {
                 if end_addr > max_addr {
                     max_addr = end_addr;
                 }
+                if ph.virt_address < min_addr {
+                    min_addr = ph.virt_address;
+                }
             }
         }
 
-        max_addr as usize
+        (max_addr - min_addr) as usize
+    }
+
+    pub fn get_virtual_address(&self) -> usize {
+        let program_headers = self.get_program_headers().unwrap();
+        let mut min_virtual = None;
+        for ph in program_headers.iter() {
+            if ph.ph_type == PT_LOAD {
+                let vaddr = ph.virt_address;
+                if min_virtual.is_none() || vaddr < min_virtual.unwrap() {
+                    min_virtual = Some(vaddr);
+                }
+            }
+        }
+        min_virtual.unwrap_or(0) as usize
     }
 
     pub fn load_to_address(&self, kernel_base_address: usize) -> Result<(), &'static str> {
@@ -96,7 +126,16 @@ impl<'a> Elf64File<'a> {
             // Must copy these out as they're potentially unaligned and rust won't create references to 
             // unaligned data (even though Intel supports it)
             let ph_type= ph.ph_type;
+            let ph_offset = ph.offset;
             let ph_vaddr = ph.virt_address;
+            let ph_paddr = ph.phys_address;
+            let ph_filesz = ph.file_size;
+            let ph_memsz = ph.mem_size;
+            let ph_align = ph.align;
+
+            info!(
+                "MEM Program Header {}: type {}, offset 0x{:x}, vaddr 0x{:x}, paddr 0x{:x}, filesz 0x{:x}, memsz 0x{:x}, align 0x{:x}",
+                i, ph_type, ph_offset, ph_vaddr, ph_paddr, ph_filesz, ph_memsz, ph_align);
 
             match ph_type {
                 PT_LOAD => {
@@ -109,6 +148,8 @@ impl<'a> Elf64File<'a> {
                 _ => {}
             }
         }
+
+        //dump_memory(kernel_base_address, self.get_mem_size());
 
         Ok(())
     }
@@ -123,12 +164,15 @@ impl<'a> Elf64File<'a> {
             return Err("Segment data is too small");
         }
 
+        info!("MEM      size {:x} vma {:x} file off {:x}",
+            ph_filesz, ph_vaddr, ph_offset);
+
         let segment_data = &self.raw_data[ph_offset..ph_offset + ph_filesz];
         let dest_addr = kernel_base_address + ph_vaddr;
 
         unsafe {
             let dest_ptr = dest_addr as *mut u8;
-            info!("    copying {:x} to {:x} ({} bytes)", segment_data.as_ptr() as usize, dest_ptr as usize, segment_data.len());
+            info!("MEM    copying {:x} to {:x} ({} bytes)", segment_data.as_ptr() as usize, dest_ptr as usize, segment_data.len());
             core::ptr::copy_nonoverlapping(segment_data.as_ptr(), dest_ptr, segment_data.len());
 
             // zero out the remaining memory if mem_size > file_size
@@ -136,15 +180,15 @@ impl<'a> Elf64File<'a> {
             if ph_memsz > ph_filesz {
                 let zero_start = dest_ptr.add(ph_filesz);
                 let zero_size = ph_memsz - ph_filesz;
-                info!("    zeroing {:x} ({} bytes)", zero_start as usize, zero_size);
+                info!("MEM    zeroing {:x} ({} bytes)", zero_start as usize, zero_size);
                 core::ptr::write_bytes(zero_start, 0, zero_size);
             }
 
             // debug... dump out the first 16 bytes of the loaded segment
-            info!("      First 8 bytes of loaded segment:");
+            info!("MEM      First 8 bytes of loaded segment:");
             for i in 0..8 {
                 let byte = *dest_ptr.add(i);
-                info!("    {:02x}", byte);
+                info!("MEM      {:x}:    {:02x}", dest_ptr.add(i) as usize, byte);
             }
         }
 
