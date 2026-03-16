@@ -40,7 +40,9 @@ use core::arch::asm;
 
 use x86_64::registers::control::Cr3;
 
-use pager::{Pager, bytes_to_pages};
+use pager::{Pager, VirtualAddress, PhysicalAddress, bytes_to_pages};
+
+use types::Address;
 
 #[cfg(test)]
 extern crate std;
@@ -92,7 +94,7 @@ fn read_keyboard_events(input: &mut Input) -> Result<(),()> {
     Ok(())
 }
 
-fn get_pages(num: usize) -> Result<usize, &'static str> {
+fn get_pages(num: usize) -> Result<Address, &'static str> {
     info!("Requesting {} pages ({} bytes)", num, num * PAGE_SIZE);
     let non_null = uefi::boot::allocate_pages(
         AllocateType::AnyPages,
@@ -101,10 +103,10 @@ fn get_pages(num: usize) -> Result<usize, &'static str> {
     )
     .map_err(|_| "Failed to allocate pages")?;
 
-    Ok(non_null.as_ptr() as usize)
+    Ok(non_null.as_ptr() as Address)
 }
 
-fn allocate_buffer(size_required: usize) -> Result<usize,&'static str> {
+fn allocate_buffer(size_required: usize) -> Result<Address,&'static str> {
     let kernel_pages = (size_required + (PAGE_SIZE-1)) / PAGE_SIZE;
     let result = get_pages(kernel_pages)?;
 
@@ -215,7 +217,7 @@ fn load_modules(mut fs: uefi::fs::FileSystem, module_list: &mut ModuleList) {
                 // by the kernel (with each module in its own P3 address space)
                 elf_module.relocate_to(module_base_address).unwrap();
                 // TODO: we need the entry point... and where the module is expected to be loaded
-                module_list.append(file_info.file_name().as_bytes(), module_base_address, elf_module.get_mem_size(), 0).unwrap();
+                module_list.append(file_info.file_name().as_bytes(), module_base_address as usize, elf_module.get_mem_size(), 0).unwrap();
             }
         }
     }
@@ -348,44 +350,37 @@ fn main() -> Status {
     info!("Kernel file contents read to 0x{:x} size: {} bytes, mem size: {} bytes", 
         kernel_buf.as_ptr() as usize, kernel_buf.len(), elf_binary.get_mem_size());
 
-    let mut pager = Pager::new(|| { get_pages(1).map_err(|_| "pager: failed to allocate page") });
+    let mut pager = Pager::new(|| { get_pages(1).map(PhysicalAddress::from_addr).map_err(|_| "pager: failed to allocate page") });
 
     let kernel_size_bytes = elf_binary.get_mem_size();
     let kernel_size_pages = bytes_to_pages(kernel_size_bytes);
     let kernel_virt_base = elf_binary.get_virtual_address();
     info!("Kernel is {} bytes ({} pages) at virtual address 0x{:x}", 
-        kernel_size_bytes, kernel_size_pages, kernel_virt_base);
+        kernel_size_bytes, kernel_size_pages, kernel_virt_base.as_u64());
 
     // technically, because memory is identity mapped, this is also mapped 
     // into the virtual space at the same address...
     let kernel_phys_address = allocate_buffer(kernel_size_bytes).unwrap();
-    pager.map_to_virtual_many(kernel_virt_base, kernel_phys_address, kernel_size_pages, 
+    pager.map_to_virtual_many(kernel_virt_base, PhysicalAddress::from_addr(kernel_phys_address), kernel_size_pages, 
         x86_64::structures::paging::PageTableFlags::WRITABLE).expect("Failed to map kernel memory");
 
     info!("Relocating kernel to address 0x{:x} - 0x{:x}", 
-        kernel_virt_base, 
-        kernel_virt_base + elf_binary.get_mem_size());
+        kernel_virt_base.as_u64(),
+        kernel_virt_base.as_u64() as usize + elf_binary.get_mem_size());
     elf_binary.relocate().unwrap();
 
     // first module in the module list is the kernel itself
     let kernel_name = cstr16!("kernel");
-    let mut module_list = ModuleList::new_from_page( get_pages(1).unwrap() ).unwrap();
-    module_list.append(kernel_name.as_bytes(), kernel_virt_base, kernel_size_bytes, 0).unwrap();
+    let mut module_list = ModuleList::new_from_page( get_pages(1).unwrap() as usize).unwrap();
+    module_list.append(kernel_name.as_bytes(), kernel_virt_base.as_u64() as usize, kernel_size_bytes, 0).unwrap();
 
     info!("Loading modules...");
     load_modules(fs, &mut module_list);
     info!("Read {} modules", module_list.get_num_modules());
 
-    let virtual_addr = 0xb80000; // VGA text buffer
-    if let Some(phys_addr) = pager.virtual_to_physical(virtual_addr) {
-        info!("virtual address 0x{:x} maps to physical address 0x{:x}", virtual_addr, phys_addr);
-    } else {
-        error!("Failed to translate kernel virtual address");
-    }
-
     info!("To debug with gdb:");
     info!("target remote localhost:1234");
-    info!("add-symbol-table esp/efi/boot/kernel.elf 0x{:x}\n", kernel_virt_base);
+    info!("add-symbol-table esp/efi/boot/kernel.elf 0x{:x}\n", kernel_virt_base.as_u64());
 
     info!("Press esc key to load kernel...");
     read_keyboard_events(input_protocol.get_mut().expect("Able to get input protocol"));
@@ -396,7 +391,8 @@ fn main() -> Status {
     let mut gop = 
         boot::open_protocol_exclusive::<GraphicsOutput>(gop_handle).unwrap();
 
-    let mut config = Config::new_from_page( get_pages(1).unwrap() ).unwrap();
+    // TODO: modify satus-struct to use Address/u64 instead of usize for pointers
+    let mut config = Config::new_from_page( get_pages(1).unwrap() as usize ).unwrap();
     config.set_module_list(module_list.get_page_ptr());
     set_framebuffer(&mut config, &mut gop);
 

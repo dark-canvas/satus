@@ -15,15 +15,14 @@ use x86_64::PhysAddr;
 
 use log::info;
 
-use crate::types::addr;
+use crate::types::Address;
 
-// TODO: USE THESE!!!
-// Note sure if we need these...?
-// Possibly they should also be capitalized
-struct physical_addr(addr);
-struct linear_addr(addr);
+#[derive(Copy, Clone)]
+pub struct PhysicalAddress(Address);
+#[derive(Copy, Clone)]
+pub struct VirtualAddress(Address);
 
-type GetPhysicalPage = fn() -> Result<usize, &'static str>;
+type GetPhysicalPage = fn() -> Result<PhysicalAddress, &'static str>;
 
 pub struct Pager {
     pml4_table: &'static mut PageTable,
@@ -34,31 +33,37 @@ pub fn bytes_to_pages(bytes: usize) -> usize {
     (bytes + 0xFFF) / 0x1000 // Round up to nearest page
 }
 
-fn get_zeroed_page(get_page: GetPhysicalPage) -> Result<usize, &'static str> {
+fn get_zeroed_page(get_page: GetPhysicalPage) -> Result<PhysicalAddress, &'static str> {
     let page_addr = (get_page)()?;
     unsafe {
-        core::ptr::write_bytes(page_addr as *mut u8, 0, 0x1000);
+        core::ptr::write_bytes(page_addr.0 as *mut u8, 0, 0x1000);
     }
     Ok(page_addr)
 }
 
-impl physical_addr {
-    fn from_addr(addr: usize) -> physical_addr {
-        physical_addr(addr)
+impl PhysicalAddress {
+    pub fn from_addr(addr: Address) -> PhysicalAddress {
+        PhysicalAddress(addr)
     }
-    fn to_linear(&self) -> linear_addr {
+    pub fn to_linear(&self) -> VirtualAddress {
         // For simplicity, we assume an identity mapping for all physical addresses.
-        linear_addr(self.0)
+        VirtualAddress(self.0)
+    }
+    pub fn as_u64(&self) -> u64 {
+        self.0
     }
 }
 
-impl linear_addr {
-    fn from_addr(addr: usize) -> linear_addr {
-        linear_addr(addr)
+impl VirtualAddress {
+    pub fn from_addr(addr: Address) -> VirtualAddress {
+        VirtualAddress(addr)
     }
-    fn to_physical(&self) -> physical_addr {
+    pub fn to_physical(&self) -> PhysicalAddress {
         // For simplicity, we assume an identity mapping for all physical addresses.
-        physical_addr(self.0)
+        PhysicalAddress(self.0)
+    }
+    pub fn as_u64(&self) -> u64 {
+        self.0
     }
 }
 
@@ -73,12 +78,12 @@ impl Pager {
             let pml4_table = &mut *(pml4_frame.start_address().as_u64() as *mut PageTable);
             Pager { pml4_table, get_page }
         };
-        match result.get_flags(pml4_frame.start_address().as_u64()) {
+        match result.get_flags(VirtualAddress::from_addr(pml4_frame.start_address().as_u64())) {
             Some(flags) => {
                 if flags.contains(x86_64::structures::paging::PageTableFlags::WRITABLE) == false {
                     info!("PML4 is not writable, making a copy of it");
                     let new_frame = PhysFrame::<Size4KiB>::containing_address(
-                        PhysAddr::new( get_zeroed_page(result.get_page).unwrap() as u64));
+                        PhysAddr::new( get_zeroed_page(result.get_page).unwrap().0 ));
                     unsafe {
                         core::ptr::copy_nonoverlapping(
                             pml4_frame.start_address().as_u64() as *const u8,
@@ -142,29 +147,33 @@ impl Pager {
         count
     }
 
-    pub fn map_to_virtual_many(&mut self, virtual_addr: usize, phys_addrs: usize, num_pages: usize, flags: x86_64::structures::paging::PageTableFlags) -> Result<(), &'static str> {
+    pub fn map_to_virtual_many(&mut self, virtual_addr: VirtualAddress, phys_addrs: PhysicalAddress, num_pages: usize, flags: x86_64::structures::paging::PageTableFlags) -> Result<(), &'static str> {
+        let virtual_addr = virtual_addr.0;
+        let phys_addrs = phys_addrs.0;
         info!("Mapping {} pages 0x{:x} physical -> 0x{:x} virtualwith flags {:?}", 
             num_pages, phys_addrs, virtual_addr, flags);
-        for i in 0..num_pages {
+        for i in 0..num_pages as u64 {
             let va = virtual_addr + i * 0x1000;
             let pa = phys_addrs + i * 0x1000;
-            self.map_to_virtual(va, pa, flags)?;
+            self.map_to_virtual(VirtualAddress::from_addr(va), PhysicalAddress::from_addr(pa), flags)?;
         }
 
         Ok(())
     }
 
-    pub fn map_to_virtual(&mut self, virtual_addr: usize, phys_addrs: usize, flags: x86_64::structures::paging::PageTableFlags) -> Result<(), &'static str> {
-        let pml4_index = (virtual_addr >> 39) & 0o777;
-        let pdpt_index = (virtual_addr >> 30) & 0o777;
-        let pd_index = (virtual_addr >> 21) & 0o777;
-        let pt_index = (virtual_addr >> 12) & 0o777;
+    pub fn map_to_virtual(&mut self, virtual_addr: VirtualAddress, phys_addrs: PhysicalAddress, flags: x86_64::structures::paging::PageTableFlags) -> Result<(), &'static str> {
+        let virtual_addr = virtual_addr.0;
+        let phys_addrs = phys_addrs.0;
+        let pml4_index = ((virtual_addr >> 39) & 0o777) as usize;
+        let pdpt_index = ((virtual_addr >> 30) & 0o777) as usize;
+        let pd_index = ((virtual_addr >> 21) & 0o777) as usize;
+        let pt_index = ((virtual_addr >> 12) & 0o777) as usize;
 
         unsafe {
             let pml4_entry = &mut self.pml4_table[pml4_index];
             if pml4_entry.is_unused() {
                 let new_frame = PhysFrame::<Size4KiB>::containing_address(
-                    PhysAddr::new( get_zeroed_page(self.get_page)? as u64));
+                    PhysAddr::new( get_zeroed_page(self.get_page)?.0));
                 info!("Setting PML4 entry {} to new frame at {:?}", pml4_index, new_frame.start_address());
                 pml4_entry.set_addr(new_frame.start_address(), flags | x86_64::structures::paging::PageTableFlags::PRESENT);
                 info!("Set PML4 entry {} to new frame at {:?}", pml4_index, new_frame.start_address());
@@ -174,7 +183,7 @@ impl Pager {
             let pdpt_entry = &mut pdpt_table[pdpt_index];
             if pdpt_entry.is_unused() {
                 let new_frame = PhysFrame::<Size4KiB>::containing_address(
-                    PhysAddr::new( get_zeroed_page(self.get_page)? as u64));
+                    PhysAddr::new( get_zeroed_page(self.get_page)?.0));
                 pdpt_entry.set_addr(new_frame.start_address(), flags | x86_64::structures::paging::PageTableFlags::PRESENT);
             }
 
@@ -182,7 +191,7 @@ impl Pager {
             let pd_entry = &mut pd_table[pd_index];
             if pd_entry.is_unused() {
                 let new_frame = PhysFrame::<Size4KiB>::containing_address(
-                    PhysAddr::new( get_zeroed_page(self.get_page)? as u64));
+                    PhysAddr::new( get_zeroed_page(self.get_page)?.0 ));
                 pd_entry.set_addr(new_frame.start_address(), flags | x86_64::structures::paging::PageTableFlags::PRESENT);
             }
 
@@ -199,8 +208,8 @@ impl Pager {
         Ok(())
     }
 
-    // TODO: use u64 as address, as the x86_64 crate genreally does a swell
-    pub fn get_flags(&self, virtual_addr: u64) -> Option<x86_64::structures::paging::PageTableFlags> {
+    pub fn get_flags(&self, virtual_addr: VirtualAddress) -> Option<x86_64::structures::paging::PageTableFlags> {
+        let virtual_addr = virtual_addr.0;
         let pml4_index = ((virtual_addr >> 39) & 0o777) as usize;
         let pdpt_index = ((virtual_addr >> 30) & 0o777) as usize;
         let pd_index = ((virtual_addr >> 21) & 0o777) as usize;
@@ -239,11 +248,12 @@ impl Pager {
     }
  
 
-    pub fn virtual_to_physical(&self, virtual_addr: usize) -> Option<usize> {
-        let pml4_index = (virtual_addr >> 39) & 0o777;
-        let pdpt_index = (virtual_addr >> 30) & 0o777;
-        let pd_index = (virtual_addr >> 21) & 0o777;
-        let pt_index = (virtual_addr >> 12) & 0o777;
+    pub fn virtual_to_physical(&self, virtual_addr: VirtualAddress) -> Option<PhysicalAddress> {
+        let virtual_addr = virtual_addr.0;
+        let pml4_index = ((virtual_addr >> 39) & 0o777) as usize;
+        let pdpt_index = ((virtual_addr >> 30) & 0o777) as usize;
+        let pd_index = ((virtual_addr >> 21) & 0o777) as usize;
+        let pt_index = ((virtual_addr >> 12) & 0o777) as usize;
 
         unsafe {
             let pml4_entry = &self.pml4_table[pml4_index];
@@ -272,7 +282,7 @@ impl Pager {
                 info!("Virtual address 0x{:x} maps to HUGE physical address 0x{:x} with flags {:?}", 
                     virtual_addr, pd_entry.addr().as_u64(), pd_entry.flags());
 
-                return Some(pd_entry.addr().as_u64() as usize + (virtual_addr & 0x1FFFFF));
+                return Some(PhysicalAddress::from_addr(pd_entry.addr().as_u64() + (virtual_addr & 0x1FFFFF)));
             }
 
             let pt_table = &mut *(pd_entry.addr().as_u64() as *mut PageTable);
@@ -284,7 +294,7 @@ impl Pager {
             info!("Virtual address 0x{:x} maps to physical address 0x{:x} with flags {:?}", 
                 virtual_addr, pt_entry.addr().as_u64(), pt_entry.flags());
 
-            Some(pt_entry.addr().as_u64() as usize + (virtual_addr & 0xFFF))
+            Some(PhysicalAddress::from_addr(pt_entry.addr().as_u64() + (virtual_addr & 0xFFF)))
         }
     }
 

@@ -11,6 +11,8 @@
 
 use uefi::prelude::*;
 use log::info;
+use crate::types::Address;
+use crate::pager::{PhysicalAddress, VirtualAddress};
 
 pub struct Elf64File<'a> {
     raw_data: &'a [u8],
@@ -106,7 +108,7 @@ impl<'a> Elf64File<'a> {
         (max_addr - min_addr) as usize
     }
 
-    pub fn get_virtual_address(&self) -> usize {
+    pub fn get_virtual_address(&self) -> VirtualAddress {
         let program_headers = self.get_program_headers().unwrap();
         let mut min_virtual = None;
         for ph in program_headers.iter() {
@@ -117,14 +119,14 @@ impl<'a> Elf64File<'a> {
                 }
             }
         }
-        min_virtual.unwrap_or(0) as usize
+        VirtualAddress::from_addr(min_virtual.unwrap_or(0))
     }
 
     pub fn relocate(&self) -> Result<(), &'static str> {
         self.relocate_to(0)
     }
 
-    pub fn relocate_to(&self, kernel_base_address: usize) -> Result<(), &'static str> {
+    pub fn relocate_to(&self, kernel_base_address: Address) -> Result<(), &'static str> {
         let program_headers = self.get_program_headers().unwrap();
         for (i, ph) in program_headers.iter().enumerate() {
             // Must copy these out as they're potentially unaligned and rust won't create references to 
@@ -157,7 +159,8 @@ impl<'a> Elf64File<'a> {
     }
 
 
-    pub fn load_segment_to_address(&self, ph: &Elf64ProgramHeader, kernel_base_address: usize) -> Result<(), &'static str> {
+    pub fn load_segment_to_address(&self, ph: &Elf64ProgramHeader, kernel_base_address: Address) -> Result<(), &'static str> {
+        let kernel_base_address = kernel_base_address as usize;
         let ph_offset = ph.offset as usize;
         let ph_filesz = ph.file_size as usize;
         let ph_vaddr = ph.virt_address as usize;
