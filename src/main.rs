@@ -15,6 +15,7 @@ mod pager;
 extern crate satus_struct;
 use satus_struct::config::Config;
 use satus_struct::module_list::ModuleList;
+use satus_struct::memory_map::{MemoryMap as SatusMemoryMap, MemoryRegionType};
 
 use core::time::Duration;
 use log::{error, info};
@@ -30,6 +31,7 @@ use uefi::fs::FileSystem;
 use uefi::boot::ScopedProtocol;
 use uefi::{CString16, CStr16, cstr16};
 use uefi::mem::memory_map::MemoryMap;
+use uefi::mem::memory_map::MemoryMapMut;
 use uefi::boot::MemoryType;
 use uefi::proto::console::text::{Input, Key, ScanCode};
 use uefi::Char16;
@@ -217,27 +219,88 @@ fn load_modules(mut fs: uefi::fs::FileSystem, module_list: &mut ModuleList) {
                 // by the kernel (with each module in its own P3 address space)
                 elf_module.relocate_to(module_base_address).unwrap();
                 // TODO: we need the entry point... and where the module is expected to be loaded
-                module_list.append(file_info.file_name().as_bytes(), module_base_address as usize, elf_module.get_mem_size(), 0).unwrap();
+                module_list.append(file_info.file_name().as_bytes(), module_base_address, elf_module.get_mem_size(), 0).unwrap();
             }
         }
     }
 }
 
+fn get_memory_type(ty: MemoryType) -> MemoryRegionType {
+    match ty {
+        MemoryType::RESERVED | MemoryType::ACPI_RECLAIM | MemoryType::ACPI_NON_VOLATILE |
+        MemoryType::MMIO | MemoryType::MMIO_PORT_SPACE | MemoryType::PAL_CODE |
+        MemoryType::PERSISTENT_MEMORY =>
+            MemoryRegionType::Reserved,
+        MemoryType::UNUSABLE | MemoryType::UNACCEPTED | MemoryType::MAX =>
+            MemoryRegionType::NonExistent,
+        // probably loader_code can be made available
+        // loader_data is what we get when we allocate memory (such as for the kernel, or a page table)
+        MemoryType::LOADER_CODE | MemoryType::LOADER_DATA =>
+            MemoryRegionType::Allocated,
+        // Conventional is legit available, boot services wont exist by the time the kernel 
+        // gets to see this struct, and we wont be using runtime services...
+        MemoryType::BOOT_SERVICES_CODE | MemoryType::BOOT_SERVICES_DATA |
+        MemoryType::RUNTIME_SERVICES_CODE | MemoryType::RUNTIME_SERVICES_DATA |
+        MemoryType::CONVENTIONAL =>
+            MemoryRegionType::Available,
+        _ => panic!("Unknown memory type {:?}", ty)
+    }
+}
+
 /// Dump memory map (from rustyboot, but modified to new API)
-fn dump_memory_map() -> Result<(),&'static str> {
+fn create_memory_map(memory_map: &mut SatusMemoryMap) -> Result<(),&'static str> {
+    let mut start_of_memory_region: u64 = 0;
+    let mut last_memory_type: MemoryRegionType = MemoryRegionType::NonExistent;
+    let mut num_pages = 0;
+    let mut last_end = 0;
+
     match uefi::boot::memory_map(MemoryType::LOADER_DATA) {
-        Ok(mmap) => {
+        Ok(mut mmap) => {
+            if !mmap.is_sorted() {
+                mmap.sort();
+            }
             for desc in mmap.entries() {
                 let ty = desc.ty;
                 let phys = desc.phys_start;
                 let virt = desc.virt_start; // this is always 0? why?
                 let pages = desc.page_count;
-                //let size_bytes = (pages as usize) * 4096;
+                let end = phys + (pages * 4096);
+
+                let memory_type = get_memory_type(desc.ty);
+                
+                // Explicitly mark any non-contiguous chunks.  A gap between 0xa0000 (640k) and 0x100000 (1M) is expected.
+                // This gap dates back to the original PC architecture, and was a region of memory reserved for hardware 
+                // memory.
+                if phys != last_end {
+                    memory_map.add_region(last_memory_type, start_of_memory_region, last_end);
+                    info!("  region {:x} - {:x} type {}", start_of_memory_region, last_end, last_memory_type as u8);
+                    info!("--------------------------------------------------- {} page gap", (phys - last_end)/4096);
+                    memory_map.add_region(MemoryRegionType::NonExistent, last_end, phys);
+                    info!("  region gap {:x} - {:x} type non-existent", last_end, phys);
+                    
+                    start_of_memory_region = phys;
+                    last_memory_type = memory_type;
+                }
+
+                if memory_type != last_memory_type {
+                    if phys != start_of_memory_region {
+                        memory_map.add_region(last_memory_type, start_of_memory_region, last_end);
+                        info!("  region {:x} - {:x} type {}", start_of_memory_region, last_end, last_memory_type as u8);
+                    }
+                    last_memory_type = memory_type;
+                    start_of_memory_region = phys;
+                }
+
                 info!(
-                    "Type={:?}, phys=0x{:x}, virt=0x{:x}, pages={}",
-                    ty, phys, virt, pages
+                    "Type={:?}, phys=0x{:x} - 0x{:x}, virt=0x{:x}, pages={}",
+                    ty, phys, phys + (pages*4096), virt, pages
                 );
+                if ty != MemoryType::RESERVED {
+                    num_pages += pages;
+                }
+                last_end = end;
             }
+            info!("{} total pages {} bytes of memory", num_pages, num_pages*4096);
             Ok(())
         }
         Err(e) => Err("Failed to get memory map"),
@@ -282,7 +345,7 @@ pub fn set_framebuffer(config: &mut Config, gop: &mut ScopedProtocol<GraphicsOut
         }
     };
     config.set_framebuffer(
-        gop.frame_buffer().as_mut_ptr() as usize,
+        gop.frame_buffer().as_mut_ptr() as Address,
         gop.frame_buffer().size() as u32);
     config.set_framebuffer_dimensions(
         width as u16, 
@@ -371,8 +434,8 @@ fn main() -> Status {
 
     // first module in the module list is the kernel itself
     let kernel_name = cstr16!("kernel");
-    let mut module_list = ModuleList::new_from_page( get_pages(1).unwrap() as usize).unwrap();
-    module_list.append(kernel_name.as_bytes(), kernel_virt_base.as_u64() as usize, kernel_size_bytes, 0).unwrap();
+    let mut module_list = ModuleList::new_from_page( get_pages(1).unwrap()).unwrap();
+    module_list.append(kernel_name.as_bytes(), kernel_virt_base.as_u64(), kernel_size_bytes, 0).unwrap();
 
     info!("Loading modules...");
     load_modules(fs, &mut module_list);
@@ -392,9 +455,14 @@ fn main() -> Status {
         boot::open_protocol_exclusive::<GraphicsOutput>(gop_handle).unwrap();
 
     // TODO: modify satus-struct to use Address/u64 instead of usize for pointers
-    let mut config = Config::new_from_page( get_pages(1).unwrap() as usize ).unwrap();
+    let mut config = Config::new_from_page( get_pages(1).unwrap() ).unwrap();
     config.set_module_list(module_list.get_page_ptr());
     set_framebuffer(&mut config, &mut gop);
+
+    // Make sure we do this after all allocations have been done...
+    let mut memory_map = SatusMemoryMap::new_from_page( get_pages(1).unwrap() ).unwrap();
+    create_memory_map(&mut memory_map);
+    config.set_memory_map(memory_map.get_page_ptr());
 
     let entry_point = elf_binary.get_header().unwrap().get_entry_point();
     info!("Kernel entry point: 0x{:x}", entry_point);
