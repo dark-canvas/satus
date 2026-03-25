@@ -435,7 +435,7 @@ fn main() -> Status {
     // first module in the module list is the kernel itself
     let kernel_name = cstr16!("kernel");
     let mut module_list = ModuleList::new_from_page( get_pages(1).unwrap()).unwrap();
-    module_list.append(kernel_name.as_bytes(), kernel_virt_base.as_u64(), kernel_size_bytes, 0).unwrap();
+    module_list.append(kernel_name.as_bytes(), kernel_phys_address, kernel_size_bytes, 0).unwrap();
 
     info!("Loading modules...");
     load_modules(fs, &mut module_list);
