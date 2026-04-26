@@ -40,7 +40,11 @@ use uefi::boot::AllocateType;
 use core::panic::PanicInfo;
 use core::arch::asm;
 
+use x86_64::PhysAddr;
 use x86_64::registers::control::Cr3;
+use x86_64::structures::paging::PageTableFlags;
+use x86_64::structures::paging::PageTable;
+
 
 use pager::{Pager, VirtualAddress, PhysicalAddress, bytes_to_pages};
 
@@ -54,6 +58,7 @@ extern crate std;
 static ALLOCATOR: uefi::allocator::Allocator = uefi::allocator::Allocator;
 
 const PAGE_SIZE: usize = 4096;
+const PAGE_SIZE_1GB: usize = 1024 * 1024 * 1024;
 
 #[cfg(not(test))]
 #[panic_handler]
@@ -389,6 +394,58 @@ fn dump_memory(base_address: usize, mem_size: usize) {
      }
 }
 
+pub fn get_pl4_table() -> &'static mut PageTable {
+    unsafe {
+        let (pl4_frame, _flags) = Cr3::read();
+        &mut *(pl4_frame.start_address().as_u64() as *mut PageTable)
+    }
+}
+
+fn create_physical_mirror(mmap: &SatusMemoryMap) {
+    // calculate the highest used memory address
+    let num_regions = mmap.get_num_regions();
+    let last_region = mmap.get_memory_region(num_regions-1).unwrap();
+    let last_addr = last_region.get_end_address();
+
+    let pl3_table_addr = get_pages(1).unwrap();
+    unsafe { core::ptr::write_bytes(pl3_table_addr as *mut u8, 0, 4096); }
+    
+    let pl4_table = get_pl4_table();
+    let pl3_table = unsafe { &mut *(pl3_table_addr as *mut PageTable) };
+
+    // iterate 1gb addresses until the end is >= the last page of memory
+    for physical_address_gb in (0u64..511) {
+        let physical_address = physical_address_gb * PAGE_SIZE_1GB as Address;
+
+        if physical_address > last_addr {
+            break;
+        }
+
+        pl3_table[physical_address_gb as usize].set_addr(
+            PhysAddr::new(physical_address),
+            PageTableFlags::GLOBAL | PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::HUGE_PAGE | PageTableFlags::NO_EXECUTE );
+    }
+
+    pl4_table[510].set_addr(
+        PhysAddr::new(pl3_table_addr),
+        PageTableFlags::GLOBAL | PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE );
+
+}
+
+fn create_kernel_stack(pager: &mut Pager, virtual_base: VirtualAddress, size: usize) {
+    // allocate enough pages for atleast size bytes
+    let num_pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+    let stack_size = num_pages * PAGE_SIZE;
+    let stack = get_pages(num_pages).unwrap();
+
+    // clear the stack with a sentinel pattern (0xa5)
+    unsafe { core::ptr::write_bytes(stack as *mut u8, 0xa5, num_pages*PAGE_SIZE); }
+
+    // map it to virtual_base - allocated_size -> virtual_base
+    pager.map_to_virtual_many(VirtualAddress(virtual_base.0 - stack_size as Address), PhysicalAddress(stack), num_pages, 
+        PageTableFlags::WRITABLE | PageTableFlags::GLOBAL | PageTableFlags::NO_EXECUTE).unwrap();
+}
+
 #[entry]
 fn main() -> Status {
     uefi::helpers::init().unwrap();
@@ -425,7 +482,7 @@ fn main() -> Status {
     // into the virtual space at the same address...
     let kernel_phys_address = allocate_buffer(kernel_size_bytes).unwrap();
     pager.map_to_virtual_many(kernel_virt_base, PhysicalAddress::from_addr(kernel_phys_address), kernel_size_pages, 
-        x86_64::structures::paging::PageTableFlags::WRITABLE).expect("Failed to map kernel memory");
+        PageTableFlags::GLOBAL | PageTableFlags::WRITABLE).expect("Failed to map kernel memory");
 
     info!("Relocating kernel to address 0x{:x} - 0x{:x}", 
         kernel_virt_base.as_u64(),
@@ -443,7 +500,7 @@ fn main() -> Status {
 
     info!("To debug with gdb:");
     info!("target remote localhost:1234");
-    info!("add-symbol-table esp/efi/boot/kernel.elf 0x{:x}\n", kernel_virt_base.as_u64());
+    info!("add-symbol-file esp/efi/boot/kernel.elf 0x{:x}\n", kernel_virt_base.as_u64());
 
     info!("Press esc key to load kernel...");
     read_keyboard_events(input_protocol.get_mut().expect("Able to get input protocol"));
@@ -463,6 +520,9 @@ fn main() -> Status {
     let mut memory_map = SatusMemoryMap::new_from_page( get_pages(1).unwrap() ).unwrap();
     create_memory_map(&mut memory_map);
     config.set_memory_map(memory_map.get_page_ptr());
+
+    create_physical_mirror(&memory_map);
+    create_kernel_stack(&mut pager, VirtualAddress(kernel_virt_base.as_u64()), 2*1024*1024);
 
     let entry_point = elf_binary.get_header().unwrap().get_entry_point();
     info!("Kernel entry point: 0x{:x}", entry_point);
@@ -485,9 +545,11 @@ fn main() -> Status {
         // using inline assembly for the config pass, I just opted for a simple jump to pass control 
         // to the kernel...
         asm!(
-            "mov rax, {val}",
+            "mov rsp, {stack_base}",  
+            "mov rax, {config}",
             "jmp {kernel}",
-            val = in(reg) config.get_page_ptr(),
+            stack_base = in(reg) kernel_virt_base.as_u64(), // stack expands down from where the kernel resides
+            config = in(reg) config.get_page_ptr(),
             kernel = in(reg) entry_point as usize,
         );
     }

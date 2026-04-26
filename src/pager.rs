@@ -37,9 +37,9 @@ use log::info;
 use crate::types::Address;
 
 #[derive(Copy, Clone)]
-pub struct PhysicalAddress(Address);
+pub struct PhysicalAddress(pub Address);
 #[derive(Copy, Clone)]
-pub struct VirtualAddress(Address);
+pub struct VirtualAddress(pub Address);
 
 type GetPhysicalPage = fn() -> Result<PhysicalAddress, &'static str>;
 
