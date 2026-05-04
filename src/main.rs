@@ -15,6 +15,7 @@ mod pager;
 extern crate satus_struct;
 use satus_struct::config::Config;
 use satus_struct::module_list::ModuleList;
+use satus_struct::memory_map::{MemoryMap as SatusMemoryMap, MemoryRegionType};
 
 use core::time::Duration;
 use log::{error, info};
@@ -30,6 +31,7 @@ use uefi::fs::FileSystem;
 use uefi::boot::ScopedProtocol;
 use uefi::{CString16, CStr16, cstr16};
 use uefi::mem::memory_map::MemoryMap;
+use uefi::mem::memory_map::MemoryMapMut;
 use uefi::boot::MemoryType;
 use uefi::proto::console::text::{Input, Key, ScanCode};
 use uefi::Char16;
@@ -38,7 +40,15 @@ use uefi::boot::AllocateType;
 use core::panic::PanicInfo;
 use core::arch::asm;
 
+use x86_64::PhysAddr;
+use x86_64::VirtAddr;
 use x86_64::registers::control::Cr3;
+use x86_64::structures::paging::PageTableFlags;
+use x86_64::structures::paging::PageTable;
+use x86_64::instructions::tables;
+use x86_64::structures::paging::Size4KiB;
+use x86_64::structures::paging::PhysFrame;
+use x86_64::structures::paging::page_table::PageTableEntry;
 
 use pager::{Pager, VirtualAddress, PhysicalAddress, bytes_to_pages};
 
@@ -52,6 +62,9 @@ extern crate std;
 static ALLOCATOR: uefi::allocator::Allocator = uefi::allocator::Allocator;
 
 const PAGE_SIZE: usize = 4096;
+const PAGE_SIZE_1GB: usize = 1024 * 1024 * 1024;
+
+const PHYSICAL_OFFSET: Address = 0xFFFFFF0000000000;
 
 #[cfg(not(test))]
 #[panic_handler]
@@ -217,27 +230,115 @@ fn load_modules(mut fs: uefi::fs::FileSystem, module_list: &mut ModuleList) {
                 // by the kernel (with each module in its own P3 address space)
                 elf_module.relocate_to(module_base_address).unwrap();
                 // TODO: we need the entry point... and where the module is expected to be loaded
-                module_list.append(file_info.file_name().as_bytes(), module_base_address as usize, elf_module.get_mem_size(), 0).unwrap();
+                module_list.append(file_info.file_name().as_bytes(), module_base_address, elf_module.get_mem_size(), 0).unwrap();
             }
         }
     }
 }
 
-/// Dump memory map (from rustyboot, but modified to new API)
-fn dump_memory_map() -> Result<(),&'static str> {
+fn get_memory_type(ty: MemoryType) -> MemoryRegionType {
+    match ty {
+        MemoryType::RESERVED | MemoryType::ACPI_RECLAIM | MemoryType::ACPI_NON_VOLATILE |
+        MemoryType::MMIO | MemoryType::MMIO_PORT_SPACE | MemoryType::PAL_CODE |
+        MemoryType::PERSISTENT_MEMORY =>
+            MemoryRegionType::Reserved,
+        MemoryType::UNUSABLE | MemoryType::UNACCEPTED | MemoryType::MAX =>
+            MemoryRegionType::NonExistent,
+        // probably loader_code can be made available
+        // loader_data is what we get when we allocate memory (such as for the kernel, or a page table)
+        MemoryType::LOADER_CODE | MemoryType::LOADER_DATA =>
+            MemoryRegionType::Allocated,
+        // Conventional is legit available, boot services wont exist by the time the kernel 
+        // gets to see this struct, and we wont be using runtime services...
+        // NOTE: BOOT_SERVICES_DATA includes all the page tables!!!
+        // We're including this in available memory, which means once these pages 
+        // get entered into the kernel pager, and provided to consumers, we can no longer 
+        // trust any memory mapped by the UEFI firmware, which means we must clean the 
+        // identity map which the firmware produced for us... we can't do that in the boot-loader, 
+        // though, as the boot loaded is executing within that identity map.
+        // We can (and do) however, reallocate the GDT and PML4 table.
+        MemoryType::BOOT_SERVICES_CODE | MemoryType::BOOT_SERVICES_DATA |
+        MemoryType::RUNTIME_SERVICES_CODE | MemoryType::RUNTIME_SERVICES_DATA |
+        MemoryType::CONVENTIONAL =>
+            MemoryRegionType::Available,
+        _ => panic!("Unknown memory type {:?}", ty)
+    }
+}
+
+fn get_max_physical_address() -> Address {
+    let mut max_addr : Address = 0;
+
     match uefi::boot::memory_map(MemoryType::LOADER_DATA) {
-        Ok(mmap) => {
+        Ok(mut mmap) => {
+            for desc in mmap.entries() {
+                let phys = desc.phys_start;
+                let pages = desc.page_count;
+                let end = phys + (pages * 4096);
+                if end > max_addr {
+                    max_addr = end;
+                }
+            }
+        },
+        Err(_) => panic!("Unable to query memory")
+    }
+
+    return max_addr;
+}
+
+/// Dump memory map (from rustyboot, but modified to new API)
+fn create_memory_map(memory_map: &mut SatusMemoryMap) -> Result<(),&'static str> {
+    let mut start_of_memory_region: u64 = 0;
+    let mut last_memory_type: MemoryRegionType = MemoryRegionType::NonExistent;
+    let mut num_pages = 0;
+    let mut last_end = 0;
+
+    match uefi::boot::memory_map(MemoryType::LOADER_DATA) {
+        Ok(mut mmap) => {
+            if !mmap.is_sorted() {
+                mmap.sort();
+            }
             for desc in mmap.entries() {
                 let ty = desc.ty;
                 let phys = desc.phys_start;
                 let virt = desc.virt_start; // this is always 0? why?
                 let pages = desc.page_count;
-                //let size_bytes = (pages as usize) * 4096;
+                let end = phys + (pages * 4096);
+
+                let memory_type = get_memory_type(desc.ty);
+                
+                // Explicitly mark any non-contiguous chunks.  A gap between 0xa0000 (640k) and 0x100000 (1M) is expected.
+                // This gap dates back to the original PC architecture, and was a region of memory reserved for hardware 
+                // memory.
+                if phys != last_end {
+                    memory_map.add_region(last_memory_type, start_of_memory_region, last_end);
+                    info!("  region {:x} - {:x} type {}", start_of_memory_region, last_end, last_memory_type as u8);
+                    info!("--------------------------------------------------- {} page gap", (phys - last_end)/4096);
+                    memory_map.add_region(MemoryRegionType::NonExistent, last_end, phys);
+                    info!("  region gap {:x} - {:x} type non-existent", last_end, phys);
+                    
+                    start_of_memory_region = phys;
+                    last_memory_type = memory_type;
+                }
+
+                if memory_type != last_memory_type {
+                    if phys != start_of_memory_region {
+                        memory_map.add_region(last_memory_type, start_of_memory_region, last_end);
+                        info!("  region {:x} - {:x} type {}", start_of_memory_region, last_end, last_memory_type as u8);
+                    }
+                    last_memory_type = memory_type;
+                    start_of_memory_region = phys;
+                }
+
                 info!(
-                    "Type={:?}, phys=0x{:x}, virt=0x{:x}, pages={}",
-                    ty, phys, virt, pages
+                    "Type={:?}, phys=0x{:x} - 0x{:x}, virt=0x{:x}, pages={}",
+                    ty, phys, phys + (pages*4096), virt, pages
                 );
+                if ty != MemoryType::RESERVED {
+                    num_pages += pages;
+                }
+                last_end = end;
             }
+            info!("{} total pages {} bytes of memory", num_pages, num_pages*4096);
             Ok(())
         }
         Err(e) => Err("Failed to get memory map"),
@@ -282,7 +383,7 @@ pub fn set_framebuffer(config: &mut Config, gop: &mut ScopedProtocol<GraphicsOut
         }
     };
     config.set_framebuffer(
-        gop.frame_buffer().as_mut_ptr() as usize,
+        gop.frame_buffer().as_mut_ptr() as Address + PHYSICAL_OFFSET,
         gop.frame_buffer().size() as u32);
     config.set_framebuffer_dimensions(
         width as u16, 
@@ -326,6 +427,130 @@ fn dump_memory(base_address: usize, mem_size: usize) {
      }
 }
 
+pub fn get_pl4_table() -> &'static mut PageTable {
+    unsafe {
+        let (pl4_frame, _flags) = Cr3::read();
+        &mut *(pl4_frame.start_address().as_u64() as *mut PageTable)
+    }
+}
+
+fn create_physical_mirror() {
+    let last_addr = get_max_physical_address();
+
+    let pl3_table_addr = get_pages(1).unwrap();
+    unsafe { core::ptr::write_bytes(pl3_table_addr as *mut u8, 0, 4096); }
+    
+    let pl4_table = get_pl4_table();
+    let pl3_table = unsafe { &mut *(pl3_table_addr as *mut PageTable) };
+
+    // iterate 1gb addresses until the end is >= the last page of memory
+    for physical_address_gb in (0u64..511) {
+        let physical_address = physical_address_gb * PAGE_SIZE_1GB as Address;
+
+        if physical_address > last_addr {
+            break;
+        }
+
+        pl3_table[physical_address_gb as usize].set_addr(
+            PhysAddr::new(physical_address),
+            PageTableFlags::GLOBAL | PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::HUGE_PAGE | PageTableFlags::NO_EXECUTE );
+    }
+
+    pl4_table[510].set_addr(
+        PhysAddr::new(pl3_table_addr),
+        PageTableFlags::GLOBAL | PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE );
+
+}
+
+fn create_kernel_stack(pager: &mut Pager, virtual_base: VirtualAddress, size: usize) {
+    // allocate enough pages for atleast size bytes
+    let num_pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+    let stack_size = num_pages * PAGE_SIZE;
+    let stack = get_pages(num_pages).unwrap();
+    info!("Allocated {} pages for {} byte stack at 0x{:016x}", num_pages, size, stack);
+
+    // clear the stack with a sentinel pattern (0xa5)
+    unsafe { core::ptr::write_bytes(stack as *mut u8, 0xab, num_pages*PAGE_SIZE); }
+
+    // map it to virtual_base - allocated_size -> virtual_base
+    pager.map_to_virtual_many(VirtualAddress(virtual_base.0 - stack_size as Address), PhysicalAddress(stack), num_pages, 
+        PageTableFlags::WRITABLE | PageTableFlags::GLOBAL | PageTableFlags::NO_EXECUTE).unwrap();
+}
+
+// We copy the GDT into a buffer allocated by us so that it's categorized as LOADER_DATA rather than 
+// BOOT_SERVICES_DATA or RUNTIME_SERVICES_DATA (by the UEFI firmware) as the kernel will treat the 
+// latter two as available memory, so we must ensure we aren't using any of it by the time the 
+// boot loader exits...
+fn recreate_gdt() {
+    let mut gdt_ptr = tables::sgdt();
+    
+    let gdt_base = gdt_ptr.base;
+    let gdt_limit = gdt_ptr.limit;
+    info!("GDT Base Address: {:?}", gdt_base);
+    info!("GDT Limit: {:#x}", gdt_limit);
+
+    let mut new_gdt = get_pages(1).unwrap();
+    new_gdt += PHYSICAL_OFFSET;
+    info!("New GDT addr: 0x{:016x}", new_gdt);
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(gdt_base.as_ptr(), new_gdt as *mut u64, (gdt_limit+1) as usize);
+
+        dump_memory(gdt_base.as_u64() as usize, 48);
+        dump_memory(new_gdt as usize, 48);
+
+        gdt_ptr.base = VirtAddr::new(new_gdt);
+        tables::lgdt(&gdt_ptr);
+    }
+}
+
+fn recreate_idt() {
+    let mut idt_ptr = tables::sidt();
+    
+    let idt_base = idt_ptr.base;
+    let idt_limit = idt_ptr.limit;
+    info!("IDT Base Address: {:?}", idt_base);
+    info!("IDT Limit: {:#x}", idt_limit);
+
+    let mut new_idt = get_pages(1).unwrap();
+    new_idt += PHYSICAL_OFFSET;
+    info!("New IDT addr: 0x{:016x}", new_idt);
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(idt_base.as_ptr(), new_idt as *mut u8, (idt_limit+1) as usize);
+
+        //core::ptr::write_bytes(new_idt as *mut u8, 0, 4096/8);
+        // attempt to add physical offset here...
+        // const PHYSICAL_OFFSET: Address = 0xFFFFFF0000000000;
+        // doesn't seem to work....
+        let ints_by_u64 = new_idt as *mut u64;
+        for interrupt in (0..(4096/16)) {
+            //                                   ........
+            *ints_by_u64.add(interrupt*2+1) |= 0x00000000ffffff00;
+        }
+
+        dump_memory(idt_base.as_u64() as usize, 4096);
+        dump_memory(new_idt as usize, 4096);
+
+        idt_ptr.base = VirtAddr::new(new_idt);
+        tables::lidt(&idt_ptr);
+
+        // test
+            // Clear RAX, set RDX to 0, clear divisor (e.g., EBX)
+            // and perform div on 32-bit (div ebx)
+        asm!(
+            "xor eax, eax",
+            "xor edx, edx",
+            "mov ebx, 0",
+            "div ebx",
+            out("eax") _,
+            out("edx") _,
+            //inout("ebx") 0 => _,
+            options(nostack)
+        );
+    }
+}
+
 #[entry]
 fn main() -> Status {
     uefi::helpers::init().unwrap();
@@ -362,7 +587,7 @@ fn main() -> Status {
     // into the virtual space at the same address...
     let kernel_phys_address = allocate_buffer(kernel_size_bytes).unwrap();
     pager.map_to_virtual_many(kernel_virt_base, PhysicalAddress::from_addr(kernel_phys_address), kernel_size_pages, 
-        x86_64::structures::paging::PageTableFlags::WRITABLE).expect("Failed to map kernel memory");
+        PageTableFlags::GLOBAL | PageTableFlags::WRITABLE).expect("Failed to map kernel memory");
 
     info!("Relocating kernel to address 0x{:x} - 0x{:x}", 
         kernel_virt_base.as_u64(),
@@ -371,8 +596,8 @@ fn main() -> Status {
 
     // first module in the module list is the kernel itself
     let kernel_name = cstr16!("kernel");
-    let mut module_list = ModuleList::new_from_page( get_pages(1).unwrap() as usize).unwrap();
-    module_list.append(kernel_name.as_bytes(), kernel_virt_base.as_u64() as usize, kernel_size_bytes, 0).unwrap();
+    let mut module_list = ModuleList::new_from_page( get_pages(1).unwrap()).unwrap();
+    module_list.append(kernel_name.as_bytes(), kernel_phys_address, kernel_size_bytes, 0).unwrap();
 
     info!("Loading modules...");
     load_modules(fs, &mut module_list);
@@ -380,7 +605,7 @@ fn main() -> Status {
 
     info!("To debug with gdb:");
     info!("target remote localhost:1234");
-    info!("add-symbol-table esp/efi/boot/kernel.elf 0x{:x}\n", kernel_virt_base.as_u64());
+    info!("add-symbol-file esp/efi/boot/kernel.elf 0x{:x}\n", kernel_virt_base.as_u64());
 
     info!("Press esc key to load kernel...");
     read_keyboard_events(input_protocol.get_mut().expect("Able to get input protocol"));
@@ -392,9 +617,23 @@ fn main() -> Status {
         boot::open_protocol_exclusive::<GraphicsOutput>(gop_handle).unwrap();
 
     // TODO: modify satus-struct to use Address/u64 instead of usize for pointers
-    let mut config = Config::new_from_page( get_pages(1).unwrap() as usize ).unwrap();
+    let mut config = Config::new_from_page( get_pages(1).unwrap() ).unwrap();
     config.set_module_list(module_list.get_page_ptr());
     set_framebuffer(&mut config, &mut gop);
+
+    create_physical_mirror();
+    create_kernel_stack(&mut pager, VirtualAddress(kernel_virt_base.as_u64()), 2*1024*1024);
+
+    recreate_gdt();
+
+    // Make sure we do this after all allocations have been done...
+    let mut memory_map = SatusMemoryMap::new_from_page( get_pages(1).unwrap() ).unwrap();
+    create_memory_map(&mut memory_map);
+    config.set_memory_map(memory_map.get_page_ptr());
+
+    // TODO:
+    // need to adjust the config/memory_map/module_list pointers...
+    // Or create the physical mirror earlier...
 
     let entry_point = elf_binary.get_header().unwrap().get_entry_point();
     info!("Kernel entry point: 0x{:x}", entry_point);
@@ -417,9 +656,11 @@ fn main() -> Status {
         // using inline assembly for the config pass, I just opted for a simple jump to pass control 
         // to the kernel...
         asm!(
-            "mov rax, {val}",
+            "mov rsp, {stack_base}",  
+            "mov rax, {config}",
             "jmp {kernel}",
-            val = in(reg) config.get_page_ptr(),
+            stack_base = in(reg) kernel_virt_base.as_u64(), // stack expands down from where the kernel resides
+            config = in(reg) config.get_page_ptr(),
             kernel = in(reg) entry_point as usize,
         );
     }

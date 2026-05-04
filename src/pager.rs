@@ -37,9 +37,9 @@ use log::info;
 use crate::types::Address;
 
 #[derive(Copy, Clone)]
-pub struct PhysicalAddress(Address);
+pub struct PhysicalAddress(pub Address);
 #[derive(Copy, Clone)]
-pub struct VirtualAddress(Address);
+pub struct VirtualAddress(pub Address);
 
 type GetPhysicalPage = fn() -> Result<PhysicalAddress, &'static str>;
 
@@ -97,26 +97,22 @@ impl Pager {
             let page_table_l4 = &mut *(pl4_frame.start_address().as_u64() as *mut PageTable);
             Pager { page_table_l4, get_page }
         };
-        match result.get_flags(VirtualAddress::from_addr(pl4_frame.start_address().as_u64())) {
-            Some(flags) => {
-                if flags.contains(x86_64::structures::paging::PageTableFlags::WRITABLE) == false {
-                    info!("PML4 is not writable, making a copy of it");
-                    let new_frame = PhysFrame::<Size4KiB>::containing_address(
-                        PhysAddr::new( get_zeroed_page(result.get_page).unwrap().0 ));
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            pl4_frame.start_address().as_u64() as *const u8,
-                            new_frame.start_address().as_u64() as *mut u8,
-                            0x1000,
-                        );
-                        result.page_table_l4 = &mut *(new_frame.start_address().as_u64() as *mut PageTable);
-                        Cr3::write(new_frame, _flags);
-                    }
-                    // If the PML4 is not writable, we need to made a copy of it and re-set CR3 as 
-                    // we'll need to modify it in order to map the kernel
-                }
-            }
-            None => panic!("PML4 is not identity mapped"),
+
+        // The PML4 table is allocated by the UEFI firmware currently, but we'll later claim all the 
+        // BOOT and RUNTIME services memory as available, so reallocate it so that it's categorized as LOADER_DATA, 
+        // which will later be marked as ALLOCATED by the kernel
+        info!("Recreating PML4");
+        let new_frame = PhysFrame::<Size4KiB>::containing_address(
+            PhysAddr::new( get_zeroed_page(result.get_page).unwrap().0 ));
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                pl4_frame.start_address().as_u64() as *const u8,
+                new_frame.start_address().as_u64() as *mut u8,
+                0x1000,
+            );
+            result.page_table_l4 = &mut *(new_frame.start_address().as_u64() as *mut PageTable);
+            // TODO... this didn't change the flags!?
+            Cr3::write(new_frame, _flags);
         }
         result
     }
