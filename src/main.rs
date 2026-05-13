@@ -383,7 +383,7 @@ pub fn set_framebuffer(config: &mut Config, gop: &mut ScopedProtocol<GraphicsOut
         }
     };
     config.set_framebuffer(
-        gop.frame_buffer().as_mut_ptr() as Address + PHYSICAL_OFFSET,
+        gop.frame_buffer().as_mut_ptr() as Address,
         gop.frame_buffer().size() as u32);
     config.set_framebuffer_dimensions(
         width as u16, 
@@ -459,6 +459,18 @@ fn create_physical_mirror() {
     pl4_table[510].set_addr(
         PhysAddr::new(pl3_table_addr),
         PageTableFlags::GLOBAL | PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE );
+
+}
+
+fn adjust_config_for_physical_mirror(config: &mut Config) {
+    // Adjust the pointers in the config struct to account for the physical mirror
+    config.set_module_list(config.get_module_list_address() + PHYSICAL_OFFSET);
+    config.set_memory_map(config.get_memory_map_address() + PHYSICAL_OFFSET);
+    config.set_framebuffer(config.get_framebuffer_address() + PHYSICAL_OFFSET,
+        config.get_framebuffer_size());
+
+    // TODO: will need to ajdust the addresses in the module list as well?
+    // Or just document that the contract says that they're physical addresses
 
 }
 
@@ -622,6 +634,7 @@ fn main() -> Status {
     set_framebuffer(&mut config, &mut gop);
 
     create_physical_mirror();
+    adjust_config_for_physical_mirror(&mut config);
     create_kernel_stack(&mut pager, VirtualAddress(kernel_virt_base.as_u64()), 2*1024*1024);
 
     recreate_gdt();
@@ -660,7 +673,7 @@ fn main() -> Status {
             "mov rax, {config}",
             "jmp {kernel}",
             stack_base = in(reg) kernel_virt_base.as_u64(), // stack expands down from where the kernel resides
-            config = in(reg) config.get_page_ptr(),
+            config = in(reg) config.get_page_ptr() + PHYSICAL_OFFSET,
             kernel = in(reg) entry_point as usize,
         );
     }
