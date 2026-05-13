@@ -634,7 +634,6 @@ fn main() -> Status {
     set_framebuffer(&mut config, &mut gop);
 
     create_physical_mirror();
-    adjust_config_for_physical_mirror(&mut config);
     create_kernel_stack(&mut pager, VirtualAddress(kernel_virt_base.as_u64()), 2*1024*1024);
 
     recreate_gdt();
@@ -643,6 +642,8 @@ fn main() -> Status {
     let mut memory_map = SatusMemoryMap::new_from_page( get_pages(1).unwrap() ).unwrap();
     create_memory_map(&mut memory_map);
     config.set_memory_map(memory_map.get_page_ptr());
+
+    adjust_config_for_physical_mirror(&mut config);
 
     // TODO:
     // need to adjust the config/memory_map/module_list pointers...
