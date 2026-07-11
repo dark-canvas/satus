@@ -14,10 +14,14 @@ mod pager;
 
 extern crate satus_struct;
 use satus_struct::config::Config;
+use satus_struct::cpu_config::CpuConfig;
 use satus_struct::module_list::ModuleList;
 use satus_struct::memory_map::{MemoryMap as SatusMemoryMap, MemoryRegionType};
 
 use core::time::Duration;
+use core::ffi::c_void;
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use log::{error, info};
 use uefi::boot::{self, SearchType};
 use uefi::prelude::*;
@@ -51,6 +55,7 @@ use x86_64::instructions::tables;
 use x86_64::structures::paging::Size4KiB;
 use x86_64::structures::paging::PhysFrame;
 use x86_64::structures::paging::page_table::PageTableEntry;
+use raw_cpuid::CpuId;
 
 use pager::{Pager, VirtualAddress, PhysicalAddress, bytes_to_pages};
 
@@ -470,6 +475,8 @@ fn adjust_config_for_physical_mirror(config: &mut Config) {
     config.set_memory_map(config.get_memory_map_address() + PHYSICAL_OFFSET);
     config.set_framebuffer(config.get_framebuffer_address() + PHYSICAL_OFFSET,
         config.get_framebuffer_size());
+    // TODO: once the CpuConfig is linked into the main config struct, it'll need to be 
+    // updated here as well.
 
     // TODO: will need to ajdust the addresses in the module list as well?
     // Or just document that the contract says that they're physical addresses
@@ -565,6 +572,42 @@ fn recreate_idt() {
     }
 }
 
+pub fn get_current_apic_id() -> u32 {
+    let cpuid = CpuId::new();
+    
+    // Fetch feature info (CPUID leaf 1)
+    cpuid.get_feature_info()
+         .map(|info| info.initial_local_apic_id() as u32)
+         .expect("Failed to read CPUID feature info")
+}
+
+extern "efiapi" fn ap_park_loop(argument: *mut c_void) {
+
+    let cpu_config = CpuConfig::from_page( argument as Address );
+    let local_apic = get_current_apic_id();
+
+    // pub fn who_am_i(&self) -> Result<usize>
+
+    /*
+    pub fn get_processor_info(
+        &self,
+        processor_number: usize,
+    ) -> Result<ProcessorInformation>
+    */
+
+    // Spin until the kernel indicatoins that the kernel_ap_entry pointer has been populated 
+    // and can be jumped to
+    while !cpu_config.ap_ready.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+
+    let kernel_fn: extern "C" fn(u32) -> ! = 
+        unsafe { core::mem::transmute(cpu_config.kernel_ap_entry) };
+
+    // TODO: pass the actual cpu id instead?
+    kernel_fn(0);
+}
+
 #[entry]
 fn main() -> Status {
     uefi::helpers::init().unwrap();
@@ -633,6 +676,19 @@ fn main() -> Status {
     info!("Total logical processors in system: {}", processor_count.total);
     info!("Enabled logical processors: {}", processor_count.enabled);
 
+    let mut cpu_config = CpuConfig::new_from_page( get_pages(1).unwrap() ).unwrap();
+
+    // Start all APs in non-blocking mode using a timeout or Event,
+    // allowing the BSP to immediately continue its own boot process.
+    let timeout_us = 0; // Wait indefinitely or handle via UEFI Events
+    mp_protocol.startup_all_aps(
+        false,
+        ap_park_loop,
+        cpu_config.get_page_ptr() as *mut c_void,
+        None,
+        Some( Duration::from_micros(timeout_us) ),
+    ).unwrap();
+
     info!("Press esc key to load kernel...");
     read_keyboard_events(input_protocol.get_mut().expect("Able to get input protocol"));
 
@@ -658,10 +714,6 @@ fn main() -> Status {
     config.set_memory_map(memory_map.get_page_ptr());
 
     adjust_config_for_physical_mirror(&mut config);
-
-    // TODO:
-    // need to adjust the config/memory_map/module_list pointers...
-    // Or create the physical mirror earlier...
 
     let entry_point = elf_binary.get_header().unwrap().get_entry_point();
     info!("Kernel entry point: 0x{:x}", entry_point);
