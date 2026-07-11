@@ -37,6 +37,8 @@ use uefi::proto::console::text::{Input, Key, ScanCode};
 use uefi::Char16;
 use uefi::proto::console::gop::{BltOp, BltPixel, PixelFormat, GraphicsOutput};
 use uefi::boot::AllocateType;
+use uefi::proto::pi::mp::MpServices;
+
 use core::panic::PanicInfo;
 use core::arch::asm;
 
@@ -618,6 +620,18 @@ fn main() -> Status {
     info!("To debug with gdb:");
     info!("target remote localhost:1234");
     info!("add-symbol-file esp/efi/boot/kernel.elf 0x{:x}\n", kernel_virt_base.as_u64());
+
+    // Trace out some SMP config...
+    let mp_handle = 
+        boot::get_handle_for_protocol::<MpServices>().expect("Can get multi-processor input handle");
+    let mut mp_protocol = 
+        boot::open_protocol_exclusive::<MpServices>(mp_handle).unwrap();
+
+    let processor_count = mp_protocol.get_number_of_processors()
+        .expect("Failed to get processor count");
+
+    info!("Total logical processors in system: {}", processor_count.total);
+    info!("Enabled logical processors: {}", processor_count.enabled);
 
     info!("Press esc key to load kernel...");
     read_keyboard_events(input_protocol.get_mut().expect("Able to get input protocol"));
