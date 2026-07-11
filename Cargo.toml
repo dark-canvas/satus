@@ -14,3 +14,4 @@ log = "0.4.29"
 uefi = { version = "0.36.1", features = ["logger", "alloc" ] }
 x86_64 = { version = "0.15.4", default-features = false, features = [ "instructions" ] } 
 satus-struct = { git = "https://github.com/dark-canvas/satus-struct" }
+raw-cpuid = "11.6.0"
