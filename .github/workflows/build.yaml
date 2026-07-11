@@ -1,0 +1,39 @@
+name: Build the kernel
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build_and_test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        # probably don't need nightly for the bootloader, but synapse uses it
+        with:
+          toolchain: nightly
+
+      - name: Install core sources (kernel needs to rebuild this for target arch)
+        run: rustup component add rust-src --toolchain nightly-x86_64-unknown-linux-gnu
+
+      - name: Build
+        run: make
+
+      - name: Run tests
+        run: make test
+
+      #- name: Cargo fmt
+      #  run: cargo fmt --all -- --check
+      #  if: matrix.toolchain == 'nightly'
+
+      #- name: Cargo clippy
+      #  run: cargo clippy -- -D warnings
+      #  if: matrix.toolchain == 'nightly'
