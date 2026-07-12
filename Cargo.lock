@@ -99,7 +99,7 @@ dependencies = [
 [[package]]
 name = "satus-struct"
 version = "0.1.0"
-source = "git+https://github.com/dark-canvas/satus-struct#2212e0c5a4b832a4fe70115a71dfd33a8fa954e8"
+source = "git+https://github.com/dark-canvas/satus-struct#e07ef5fd5e6ab4f1189eb2dae3d87b42d8fcc89d"
 
 [[package]]
 name = "syn"

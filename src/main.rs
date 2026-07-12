@@ -471,12 +471,14 @@ fn create_physical_mirror() {
 
 fn adjust_config_for_physical_mirror(config: &mut Config) {
     // Adjust the pointers in the config struct to account for the physical mirror
-    config.set_module_list(config.get_module_list_address() + PHYSICAL_OFFSET);
-    config.set_memory_map(config.get_memory_map_address() + PHYSICAL_OFFSET);
+    config.set_cpu_config_address(config.get_cpu_config_address() + PHYSICAL_OFFSET);
+    config.set_module_list_address(config.get_module_list_address() + PHYSICAL_OFFSET);
+    config.set_memory_map_address(config.get_memory_map_address() + PHYSICAL_OFFSET);
     config.set_framebuffer(config.get_framebuffer_address() + PHYSICAL_OFFSET,
         config.get_framebuffer_size());
-    // TODO: once the CpuConfig is linked into the main config struct, it'll need to be 
-    // updated here as well.
+
+    // don't forget to adjust the config itself...
+    config.set_page_ptr(config.get_page_ptr() + PHYSICAL_OFFSET);
 
     // TODO: will need to ajdust the addresses in the module list as well?
     // Or just document that the contract says that they're physical addresses
@@ -681,6 +683,7 @@ fn main() -> Status {
     // Start all APs in non-blocking mode using a timeout or Event,
     // allowing the BSP to immediately continue its own boot process.
     let timeout_us = 0; // Wait indefinitely or handle via UEFI Events
+    /*
     mp_protocol.startup_all_aps(
         false,
         ap_park_loop,
@@ -688,7 +691,7 @@ fn main() -> Status {
         None,
         Some( Duration::from_micros(timeout_us) ),
     ).unwrap();
-
+    */
     info!("Press esc key to load kernel...");
     read_keyboard_events(input_protocol.get_mut().expect("Able to get input protocol"));
 
@@ -700,7 +703,8 @@ fn main() -> Status {
 
     // TODO: modify satus-struct to use Address/u64 instead of usize for pointers
     let mut config = Config::new_from_page( get_pages(1).unwrap() ).unwrap();
-    config.set_module_list(module_list.get_page_ptr());
+    config.set_module_list(&module_list);
+    config.set_cpu_config(&cpu_config);
     set_framebuffer(&mut config, &mut gop);
 
     create_physical_mirror();
@@ -711,7 +715,7 @@ fn main() -> Status {
     // Make sure we do this after all allocations have been done...
     let mut memory_map = SatusMemoryMap::new_from_page( get_pages(1).unwrap() ).unwrap();
     create_memory_map(&mut memory_map);
-    config.set_memory_map(memory_map.get_page_ptr());
+    config.set_memory_map(&memory_map);
 
     adjust_config_for_physical_mirror(&mut config);
 
@@ -740,7 +744,7 @@ fn main() -> Status {
             "mov rax, {config}",
             "jmp {kernel}",
             stack_base = in(reg) kernel_virt_base.as_u64(), // stack expands down from where the kernel resides
-            config = in(reg) config.get_page_ptr() + PHYSICAL_OFFSET,
+            config = in(reg) config.get_page_ptr(),
             kernel = in(reg) entry_point as usize,
         );
     }
