@@ -93,13 +93,14 @@ dependencies = [
  "raw-cpuid",
  "satus-struct",
  "uefi",
+ "uefi-raw 0.15.1",
  "x86_64",
 ]
 
 [[package]]
 name = "satus-struct"
 version = "0.1.0"
-source = "git+https://github.com/dark-canvas/satus-struct#e07ef5fd5e6ab4f1189eb2dae3d87b42d8fcc89d"
+source = "git+https://github.com/dark-canvas/satus-struct#bc95a1e2fafbd0903fd61a517fed80baf99e97c1"
 
 [[package]]
 name = "syn"
@@ -133,7 +134,7 @@ dependencies = [
  "ptr_meta",
  "ucs2",
  "uefi-macros",
- "uefi-raw",
+ "uefi-raw 0.13.0",
  "uguid",
 ]
 
@@ -153,6 +154,16 @@ name = "uefi-raw"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f64fe59e11af447d12fd60a403c74106eb104309f34b4c6dbce6e927d97da9d"
+dependencies = [
+ "bitflags",
+ "uguid",
+]
+
+[[package]]
+name = "uefi-raw"
+version = "0.15.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a36f49db0b04a8dfd246a26ddf8d2526a2ffd8cf946ae7fe603fd0c5fbd2786"
 dependencies = [
  "bitflags",
  "uguid",

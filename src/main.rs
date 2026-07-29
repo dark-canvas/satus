@@ -12,19 +12,24 @@ mod types;
 mod elf;
 mod pager;
 
+use uefi::table::cfg::ConfigTableEntry;
+
 extern crate satus_struct;
 use satus_struct::config::Config;
 use satus_struct::cpu_config::CpuConfig;
+use satus_struct::cpu_config::PerCpuConfig;
 use satus_struct::module_list::ModuleList;
 use satus_struct::memory_map::{MemoryMap as SatusMemoryMap, MemoryRegionType};
 
+use core::ptr::NonNull;
 use core::time::Duration;
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use log::{error, info};
 use uefi::boot::{self, SearchType};
 use uefi::prelude::*;
+use uefi::data_types::Event;
 use uefi::proto::device_path::text::{
     AllowShortcuts, DevicePathToText, DisplayOnly,
 };
@@ -83,7 +88,9 @@ fn panic(info: &PanicInfo) -> ! {
             location.line(),
         );
     }
-    loop {}
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 fn read_keyboard_events(input: &mut Input) -> Result<(),()> {
@@ -114,10 +121,20 @@ fn read_keyboard_events(input: &mut Input) -> Result<(),()> {
     Ok(())
 }
 
+// returns "conventional" memory (aka, memory below 1MB) which is accessible in 
+// 16-bit real mode via a segment, offset pair
+fn get_real_mode_pages(num: usize) -> Result<Address, &'static str> {
+    get_pages_with_type(num, AllocateType::MaxAddress(0x100000))
+}
+
 fn get_pages(num: usize) -> Result<Address, &'static str> {
+    get_pages_with_type(num, AllocateType::AnyPages)
+}
+
+fn get_pages_with_type(num: usize, page_type: AllocateType) -> Result<Address, &'static str> {
     info!("Requesting {} pages ({} bytes)", num, num * PAGE_SIZE);
     let non_null = uefi::boot::allocate_pages(
-        AllocateType::AnyPages,
+        page_type,
         MemoryType::LOADER_DATA,
         num,
     )
@@ -170,7 +187,7 @@ fn gfx_test() {
         boot::get_handle_for_protocol::<GraphicsOutput>().expect("Can get GOP handle");
     let mut gop = 
         boot::open_protocol_exclusive::<GraphicsOutput>(gop_handle).unwrap();
-;
+
     info!("Available GOP modes:");
     for mode in gop.modes() {
         let mode_info = mode.info();
@@ -369,6 +386,35 @@ fn get_total_pages() -> u64 {
 
 
     total_pages
+}
+
+/// Search the UEFI system table for the RSDP address in the ACPI config.
+/// The Root System Description Pointer (RSDP) address is provided to the kernel, and 
+/// can be used to navigate to the MADT table in order to extract information on 
+/// the available cores.
+pub fn find_rsdp_address() -> Option<usize> {
+    // the uefi-rs crate doesn't parse the system table, but we can get the raw pointer for it...
+    let raw_sys_table_ptr = unsafe { uefi::table::system_table_raw().unwrap().as_ptr() };
+    // TODO: what to do if I can't get the pointer?
+    
+    // and cast it to the structs provided by the uefi_raw crate
+    let raw_table = unsafe { &*(raw_sys_table_ptr as *const uefi_raw::table::system::SystemTable) };
+    
+    // and create a slice of configuration table entries
+    let config_tables = unsafe {
+        core::slice::from_raw_parts(
+            raw_table.configuration_table,
+            raw_table.number_of_configuration_table_entries,
+        )
+    };
+
+    // Pick out the ACPI/ACPI2 config table (cast from uefi_raw's guid format to uefi's type)
+    let entry = config_tables.iter().find(|entry| {
+        let guid = uefi::Guid::from_bytes(entry.vendor_guid.to_bytes());
+        guid == ConfigTableEntry::ACPI2_GUID || guid == ConfigTableEntry::ACPI_GUID
+    });
+
+    entry.map(|e| e.vendor_table as usize)
 }
 
 pub fn set_framebuffer(config: &mut Config, gop: &mut ScopedProtocol<GraphicsOutput>) {
@@ -583,10 +629,24 @@ pub fn get_current_apic_id() -> u32 {
          .expect("Failed to read CPUID feature info")
 }
 
-extern "efiapi" fn ap_park_loop(argument: *mut c_void) {
+extern "efiapi" fn ap_park_loop(arg: *mut c_void) {
 
-    let cpu_config = CpuConfig::from_page( argument as Address );
+    let cpu_config = CpuConfig::from_page( arg as Address );
     let local_apic = get_current_apic_id();
+    let cpu_id = local_apic as usize;
+
+
+    let per_cpu_slice : &[PerCpuConfig] = unsafe {
+        core::slice::from_raw_parts(
+            cpu_config.per_cpu_config as *const PerCpuConfig,
+            cpu_config.get_num_cpus() as usize )
+    };
+
+    // use local_apic ID (eg, 1,2,3) to index into cpu_config::per_cpu_config in 
+    // order to acquire a unique stack (but this isn't using the 0th element currently)
+    let stack = &per_cpu_slice[cpu_id].stack;
+    let stack_base = stack.as_ptr() as Address + stack.len() as Address;
+
 
     // pub fn who_am_i(&self) -> Result<usize>
 
@@ -597,17 +657,42 @@ extern "efiapi" fn ap_park_loop(argument: *mut c_void) {
     ) -> Result<ProcessorInformation>
     */
 
-    // Spin until the kernel indicatoins that the kernel_ap_entry pointer has been populated 
+    cpu_config.active_cpus.fetch_add(1, Ordering::SeqCst);
+
+    // Spin until the kernel indications that the kernel_ap_entry pointer has been populated 
     // and can be jumped to
     while !cpu_config.ap_ready.load(Ordering::Acquire) {
         core::hint::spin_loop();
     }
 
-    let kernel_fn: extern "C" fn(u32) -> ! = 
-        unsafe { core::mem::transmute(cpu_config.kernel_ap_entry) };
+    //let kernel_fn: extern "C" fn(u32) -> ! = 
+    //    unsafe { core::mem::transmute(cpu_config.kernel_ap_entry) };
 
     // TODO: pass the actual cpu id instead?
-    kernel_fn(0);
+    //kernel_fn(0);
+
+    unsafe {
+        asm!(
+            "mov rsp, {stack_base}",  
+            "mov rax, {cpu_id}",
+            "jmp {kernel}",
+            stack_base = in(reg) stack_base,
+            cpu_id = in(reg) cpu_id,
+            kernel = in(reg) cpu_config.kernel_ap_entry as usize,
+        );
+    }
+}
+
+extern "efiapi" fn aps_started_callback(event: Event, context: Option<core::ptr::NonNull<c_void>>) {
+    info!("AP Callback");
+
+    let cpu_config = CpuConfig::from_page( context.unwrap().as_ptr() as Address );
+    cpu_config.ap_started.store(true, Ordering::Relaxed);
+    
+}
+
+fn breakpoint() {
+    info!("Artificial breakpoint")
 }
 
 #[entry]
@@ -616,6 +701,7 @@ fn main() -> Status {
 
     let address_of_main = main as *const ();
     info!("Address of main: 0x{:x}", address_of_main as usize);
+    info!("Address of read_keyboard_events 0x{:x}", read_keyboard_events as usize);
 
     let handle = 
         boot::get_handle_for_protocol::<Input>().expect("Can get input");
@@ -679,21 +765,102 @@ fn main() -> Status {
     info!("Enabled logical processors: {}", processor_count.enabled);
 
     let mut cpu_config = CpuConfig::new_from_page( get_pages(1).unwrap() ).unwrap();
+    info!("got cpu config");
+    if cpu_config.ap_ready.load(Ordering::Acquire) {
+        info!("aps are ready");
+    } else {
+        info!("aps are not ready");
+    }
+    cpu_config.set_num_cpus(processor_count.total as u32);
 
-    // Start all APs in non-blocking mode using a timeout or Event,
-    // allowing the BSP to immediately continue its own boot process.
-    let timeout_us = 0; // Wait indefinitely or handle via UEFI Events
-    /*
+    let rsdp_pointer = find_rsdp_address().unwrap();
+    info!("Found rsdp pointer {:x}", rsdp_pointer);
+    cpu_config.rsdp_address = rsdp_pointer as Address;
+
+    cpu_config.trampoline_address = get_real_mode_page(1).unwrap();
+
+    // allocate memory for per-cpu stacks and other information...
+    // num_cpus * size_of::<PerCpuConfig>()
+    let pages_required = (cpu_config.get_num_cpus() as usize * size_of::<PerCpuConfig>()) / 4096;
+    let per_cpu_alloc = get_pages(pages_required).unwrap();
+
+    // TODO: initialize it
+    // TODO: figure out stacks?  Currently cpu-0 stack is allocated differently?
+    let per_cpu_slice: &mut[PerCpuConfig] = unsafe {
+        core::slice::from_raw_parts_mut( 
+            per_cpu_alloc as *mut PerCpuConfig, 
+            cpu_config.get_num_cpus() as usize )
+    };
+    for cpu in per_cpu_slice {
+        cpu.stack_guard = 0x5150515051505150;
+    }
+
+    cpu_config.per_cpu_config = per_cpu_alloc;
+
+
+    info!("Press esc key to load kernel...");
+    read_keyboard_events(input_protocol.get_mut().expect("Able to get input protocol"));
+
+    // there's 1 active CPU already (we're running on it)
+    cpu_config.active_cpus = AtomicU32::new(1);
+
+    // This is a mis-use of the UEFI API and so probably isn't the right way to go about things, but 
+    // it may work for long enough to prototype SMP.
+    // Essentially, startup_all_aps is designed to run a function on all APs and then indicate, via a 
+    // callback, that the function has completed (returned).  However, my callback never exits, as it 
+    // waits for the kernel to start, and therefore the event callback is only called when the timeout 
+    // expires (in other words, the event callback can't be used to indicate that the AP function has 
+    // actually started at all).
+    // Also, supposedly, once boot services have been exited, all memory allocatd to run the AP 
+    // function is reclaimed, so it's unsafe for my ap_park_loop to execute beyond this point.  I'm not 
+    // entirely sure what this means -- I don't think the park loop depends on UEFI allocated memory 
+    // except, perhaps, for stack space, so that may need to be re-allocated.
+    let event = unsafe {
+        boot::create_event(
+            uefi::boot::EventType::NOTIFY_SIGNAL,
+            //uefi::boot::EventType::NOTIFY_WAIT,
+            uefi::boot::Tpl::CALLBACK,
+            Some(aps_started_callback), 
+            Some(NonNull::new(cpu_config.get_page_ptr() as *mut c_void ).unwrap() ),
+        ).unwrap()
+    };
+    let timeout_ms = 1;
     mp_protocol.startup_all_aps(
         false,
         ap_park_loop,
         cpu_config.get_page_ptr() as *mut c_void,
-        None,
-        Some( Duration::from_micros(timeout_us) ),
+        Some(unsafe { event.unsafe_clone() } ),
+        Some( Duration::from_millis(timeout_ms) ),
     ).unwrap();
+
+    info!("APs starting");
+
+    // the callback defined above will get called after the 1ms timeout, but it's largely 
+    // meaningless... in order to ensure all the threads are actually started, we need to 
+    // examine the active_cpus counter which is actually updated in each of the ap's 
+    // execution paths...
+
+    /*
+    while !cpu_config.ap_started.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
     */
-    info!("Press esc key to load kernel...");
-    read_keyboard_events(input_protocol.get_mut().expect("Able to get input protocol"));
+    while cpu_config.active_cpus.load(Ordering::Acquire) != cpu_config.num_cpus {
+        core::hint::spin_loop();
+    }
+
+    info!("APs running");
+
+    breakpoint();
+   
+    // Wait for the events to fire (we just loop here)
+    //let mut events = [event];
+    //loop {
+        // Blocks until at least one event in the array is signaled
+    //   uefi::boot::wait_for_event(&mut events).expect("Wait for event failed");
+    //}
+    //info!("Received event");
+
 
     use uefi::proto::console::gop::{GraphicsOutput, PixelFormat};
     let gop_handle = 
