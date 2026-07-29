@@ -777,7 +777,7 @@ fn main() -> Status {
     info!("Found rsdp pointer {:x}", rsdp_pointer);
     cpu_config.rsdp_address = rsdp_pointer as Address;
 
-    cpu_config.trampoline_address = get_real_mode_page(1).unwrap();
+    cpu_config.trampoline_address = get_real_mode_pages(1).unwrap();
 
     // allocate memory for per-cpu stacks and other information...
     // num_cpus * size_of::<PerCpuConfig>()
