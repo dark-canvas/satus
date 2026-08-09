@@ -742,11 +742,6 @@ fn main() -> Status {
     // there's 1 active CPU already (we're running on it)
     cpu_config.active_cpus = AtomicU32::new(1);
 
-    // the callback defined above will get called after the 1ms timeout, but it's largely 
-    // meaningless... in order to ensure all the threads are actually started, we need to 
-    // examine the active_cpus counter which is actually updated in each of the ap's 
-    // execution paths...
-
     use uefi::proto::console::gop::{GraphicsOutput, PixelFormat};
     let gop_handle = 
         boot::get_handle_for_protocol::<GraphicsOutput>().expect("Can get GOP handle");
