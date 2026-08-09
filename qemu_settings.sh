@@ -1,9 +1,14 @@
 echo \
     -enable-kvm \
     -m 2G \
-    -cpu host \
+    -cpu host,x2apic \
+    -machine q35,kernel-irqchip=split \
+    -device intel-iommu,intremap=on \
     -smp cpus=4,sockets=1,cores=2,threads=2 \
     -drive if=pflash,format=raw,readonly=on,file=OVMF_CODE_4M.fd \
-    -drive if=pflash,format=raw,readonly=on,file=OVMF_VARS_4M.fd \
-    -drive format=raw,file=fat:rw:esp \
-    -serial file:output.log
+    -drive if=pflash,format=raw,readonly=off,file=OVMF_VARS_4M.fd \
+    -drive format=raw,file=fat:rw:esp,if=none,id=bootdisk \
+    -device ide-hd,drive=bootdisk,bootindex=1 \
+    -serial file:output.log \
+    -no-reboot \
+    -no-shutdown
