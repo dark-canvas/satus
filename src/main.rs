@@ -629,68 +629,6 @@ pub fn get_current_apic_id() -> u32 {
          .expect("Failed to read CPUID feature info")
 }
 
-extern "efiapi" fn ap_park_loop(arg: *mut c_void) {
-
-    let cpu_config = CpuConfig::from_page( arg as Address );
-    let local_apic = get_current_apic_id();
-    let cpu_id = local_apic as usize;
-
-
-    let per_cpu_slice : &[PerCpuConfig] = unsafe {
-        core::slice::from_raw_parts(
-            cpu_config.per_cpu_config as *const PerCpuConfig,
-            cpu_config.get_num_cpus() as usize )
-    };
-
-    // use local_apic ID (eg, 1,2,3) to index into cpu_config::per_cpu_config in 
-    // order to acquire a unique stack (but this isn't using the 0th element currently)
-    let stack = &per_cpu_slice[cpu_id].stack;
-    let stack_base = stack.as_ptr() as Address + stack.len() as Address;
-
-
-    // pub fn who_am_i(&self) -> Result<usize>
-
-    /*
-    pub fn get_processor_info(
-        &self,
-        processor_number: usize,
-    ) -> Result<ProcessorInformation>
-    */
-
-    cpu_config.active_cpus.fetch_add(1, Ordering::SeqCst);
-
-    // Spin until the kernel indications that the kernel_ap_entry pointer has been populated 
-    // and can be jumped to
-    while !cpu_config.ap_ready.load(Ordering::Acquire) {
-        core::hint::spin_loop();
-    }
-
-    //let kernel_fn: extern "C" fn(u32) -> ! = 
-    //    unsafe { core::mem::transmute(cpu_config.kernel_ap_entry) };
-
-    // TODO: pass the actual cpu id instead?
-    //kernel_fn(0);
-
-    unsafe {
-        asm!(
-            "mov rsp, {stack_base}",  
-            "mov rax, {cpu_id}",
-            "jmp {kernel}",
-            stack_base = in(reg) stack_base,
-            cpu_id = in(reg) cpu_id,
-            kernel = in(reg) cpu_config.kernel_ap_entry as usize,
-        );
-    }
-}
-
-extern "efiapi" fn aps_started_callback(event: Event, context: Option<core::ptr::NonNull<c_void>>) {
-    info!("AP Callback");
-
-    let cpu_config = CpuConfig::from_page( context.unwrap().as_ptr() as Address );
-    cpu_config.ap_started.store(true, Ordering::Relaxed);
-    
-}
-
 fn breakpoint() {
     info!("Artificial breakpoint")
 }
