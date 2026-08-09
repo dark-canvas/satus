@@ -795,8 +795,8 @@ fn main() -> Status {
         cpu.stack_guard = 0x5150515051505150;
     }
 
-    cpu_config.per_cpu_config = per_cpu_alloc;
-
+    // TODO: move this into adjust_config_for_physical_mirror?
+    cpu_config.per_cpu_config = per_cpu_alloc + PHYSICAL_OFFSET;
 
     info!("Press esc key to load kernel...");
     read_keyboard_events(input_protocol.get_mut().expect("Able to get input protocol"));
@@ -804,63 +804,10 @@ fn main() -> Status {
     // there's 1 active CPU already (we're running on it)
     cpu_config.active_cpus = AtomicU32::new(1);
 
-    // This is a mis-use of the UEFI API and so probably isn't the right way to go about things, but 
-    // it may work for long enough to prototype SMP.
-    // Essentially, startup_all_aps is designed to run a function on all APs and then indicate, via a 
-    // callback, that the function has completed (returned).  However, my callback never exits, as it 
-    // waits for the kernel to start, and therefore the event callback is only called when the timeout 
-    // expires (in other words, the event callback can't be used to indicate that the AP function has 
-    // actually started at all).
-    // Also, supposedly, once boot services have been exited, all memory allocatd to run the AP 
-    // function is reclaimed, so it's unsafe for my ap_park_loop to execute beyond this point.  I'm not 
-    // entirely sure what this means -- I don't think the park loop depends on UEFI allocated memory 
-    // except, perhaps, for stack space, so that may need to be re-allocated.
-    let event = unsafe {
-        boot::create_event(
-            uefi::boot::EventType::NOTIFY_SIGNAL,
-            //uefi::boot::EventType::NOTIFY_WAIT,
-            uefi::boot::Tpl::CALLBACK,
-            Some(aps_started_callback), 
-            Some(NonNull::new(cpu_config.get_page_ptr() as *mut c_void ).unwrap() ),
-        ).unwrap()
-    };
-    let timeout_ms = 1;
-    mp_protocol.startup_all_aps(
-        false,
-        ap_park_loop,
-        cpu_config.get_page_ptr() as *mut c_void,
-        Some(unsafe { event.unsafe_clone() } ),
-        Some( Duration::from_millis(timeout_ms) ),
-    ).unwrap();
-
-    info!("APs starting");
-
     // the callback defined above will get called after the 1ms timeout, but it's largely 
     // meaningless... in order to ensure all the threads are actually started, we need to 
     // examine the active_cpus counter which is actually updated in each of the ap's 
     // execution paths...
-
-    /*
-    while !cpu_config.ap_started.load(Ordering::Acquire) {
-        core::hint::spin_loop();
-    }
-    */
-    while cpu_config.active_cpus.load(Ordering::Acquire) != cpu_config.num_cpus {
-        core::hint::spin_loop();
-    }
-
-    info!("APs running");
-
-    breakpoint();
-   
-    // Wait for the events to fire (we just loop here)
-    //let mut events = [event];
-    //loop {
-        // Blocks until at least one event in the array is signaled
-    //   uefi::boot::wait_for_event(&mut events).expect("Wait for event failed");
-    //}
-    //info!("Received event");
-
 
     use uefi::proto::console::gop::{GraphicsOutput, PixelFormat};
     let gop_handle = 

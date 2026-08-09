@@ -9,4 +9,6 @@ echo \
     -drive if=pflash,format=raw,readonly=off,file=OVMF_VARS_4M.fd \
     -drive format=raw,file=fat:rw:esp,if=none,id=bootdisk \
     -device ide-hd,drive=bootdisk,bootindex=1 \
-    -serial file:output.log
+    -serial file:output.log \
+    -no-reboot \
+    -no-shutdown
