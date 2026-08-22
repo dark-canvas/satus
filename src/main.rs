@@ -77,6 +77,7 @@ const PAGE_SIZE: usize = 4096;
 const PAGE_SIZE_1GB: usize = 1024 * 1024 * 1024;
 
 const PHYSICAL_OFFSET: Address = 0xFFFFFF0000000000;
+const KERNEL_BSP_STACK_BASE: VirtualAddress = pager::VirtualAddress(0xFFFFFFF000000000);
 
 #[cfg(not(test))]
 #[panic_handler]
@@ -755,7 +756,7 @@ fn main() -> Status {
     set_framebuffer(&mut config, &mut gop);
 
     create_physical_mirror();
-    create_kernel_stack(&mut pager, VirtualAddress(kernel_virt_base.as_u64()), 2*1024*1024);
+    create_kernel_stack(&mut pager, KERNEL_BSP_STACK_BASE, 2*1024*1024);
 
     recreate_gdt();
 
@@ -790,7 +791,8 @@ fn main() -> Status {
             "mov rsp, {stack_base}",  
             "mov rax, {config}",
             "jmp {kernel}",
-            stack_base = in(reg) kernel_virt_base.as_u64(), // stack expands down from where the kernel resides
+            stack_base = in(reg) KERNEL_BSP_STACK_BASE.as_u64(), // stack expands down from near
+                                                                 // top of virtual address space
             config = in(reg) config.get_page_ptr(),
             kernel = in(reg) entry_point as usize,
         );
