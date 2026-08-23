@@ -17,7 +17,6 @@ use uefi::table::cfg::ConfigTableEntry;
 extern crate satus_struct;
 use satus_struct::config::Config;
 use satus_struct::cpu_config::CpuConfig;
-use satus_struct::cpu_config::PerCpuConfig;
 use satus_struct::module_list::ModuleList;
 use satus_struct::memory_map::{MemoryMap as SatusMemoryMap, MemoryRegionType};
 
@@ -77,7 +76,8 @@ const PAGE_SIZE: usize = 4096;
 const PAGE_SIZE_1GB: usize = 1024 * 1024 * 1024;
 
 const PHYSICAL_OFFSET: Address = 0xFFFFFF0000000000;
-const KERNEL_BSP_STACK_BASE: VirtualAddress = pager::VirtualAddress(0xFFFFFFF000000000);
+const PER_CPU_STATE_SIZE: Address = 2*1024*1024;
+const KERNEL_BSP_STACK_BASE: VirtualAddress = pager::VirtualAddress(0xFFFFFFF000000000 + PER_CPU_STATE_SIZE);
 
 #[cfg(not(test))]
 #[panic_handler]
@@ -718,30 +718,8 @@ fn main() -> Status {
 
     cpu_config.trampoline_address = get_real_mode_pages(1).unwrap();
 
-    // allocate memory for per-cpu stacks and other information...
-    // num_cpus * size_of::<PerCpuConfig>()
-    let pages_required = (cpu_config.get_num_cpus() as usize * size_of::<PerCpuConfig>()) / 4096;
-    let per_cpu_alloc = get_pages(pages_required).unwrap();
-
-    // TODO: initialize it
-    // TODO: figure out stacks?  Currently cpu-0 stack is allocated differently?
-    let per_cpu_slice: &mut[PerCpuConfig] = unsafe {
-        core::slice::from_raw_parts_mut( 
-            per_cpu_alloc as *mut PerCpuConfig, 
-            cpu_config.get_num_cpus() as usize )
-    };
-    for cpu in per_cpu_slice {
-        cpu.stack_guard = 0x5150515051505150;
-    }
-
-    // TODO: move this into adjust_config_for_physical_mirror?
-    cpu_config.per_cpu_config = per_cpu_alloc + PHYSICAL_OFFSET;
-
     info!("Press esc key to load kernel...");
     read_keyboard_events(input_protocol.get_mut().expect("Able to get input protocol"));
-
-    // there's 1 active CPU already (we're running on it)
-    cpu_config.active_cpus = AtomicU32::new(1);
 
     use uefi::proto::console::gop::{GraphicsOutput, PixelFormat};
     let gop_handle = 
@@ -756,7 +734,7 @@ fn main() -> Status {
     set_framebuffer(&mut config, &mut gop);
 
     create_physical_mirror();
-    create_kernel_stack(&mut pager, KERNEL_BSP_STACK_BASE, 2*1024*1024);
+    create_kernel_stack(&mut pager, KERNEL_BSP_STACK_BASE, 1*1024*1024);
 
     recreate_gdt();
 
