@@ -704,18 +704,11 @@ fn main() -> Status {
     info!("Enabled logical processors: {}", processor_count.enabled);
 
     let mut cpu_config = CpuConfig::new_from_page( get_pages(1).unwrap() ).unwrap();
-    info!("got cpu config");
-    if cpu_config.ap_ready.load(Ordering::Acquire) {
-        info!("aps are ready");
-    } else {
-        info!("aps are not ready");
-    }
     cpu_config.set_num_cpus(processor_count.total as u32);
 
     let rsdp_pointer = find_rsdp_address().unwrap();
     info!("Found rsdp pointer {:x}", rsdp_pointer);
     cpu_config.rsdp_address = rsdp_pointer as Address;
-
     cpu_config.trampoline_address = get_real_mode_pages(1).unwrap();
 
     info!("Press esc key to load kernel...");
