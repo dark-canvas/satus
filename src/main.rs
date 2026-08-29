@@ -75,9 +75,12 @@ static ALLOCATOR: uefi::allocator::Allocator = uefi::allocator::Allocator;
 const PAGE_SIZE: usize = 4096;
 const PAGE_SIZE_1GB: usize = 1024 * 1024 * 1024;
 
+// TODO: these should come from the kernel rather than be duplicated here
 const PHYSICAL_OFFSET: Address = 0xFFFFFF0000000000;
-const PER_CPU_STATE_SIZE: Address = 2*1024*1024;
-const KERNEL_BSP_STACK_BASE: VirtualAddress = pager::VirtualAddress(0xFFFFFFF000000000 + PER_CPU_STATE_SIZE);
+const PER_CPU_STATE_SIZE: usize = 1*1024*1024;
+const KERNEL_CPU_STATE_BASE: VirtualAddress = pager::VirtualAddress(0xFFFFFFF000000000);
+const KERNEL_BSP_STACK_BASE: VirtualAddress = pager::VirtualAddress(0xFFFFFFF000000000 + PER_CPU_STATE_SIZE as Address);
+const KERNEL_BSP_STACK_SIZE: usize = 238 * PAGE_SIZE;
 
 #[cfg(not(test))]
 #[panic_handler]
@@ -120,6 +123,10 @@ fn read_keyboard_events(input: &mut Input) -> Result<(),()> {
     }
 
     Ok(())
+}
+
+fn page_count(bytes: usize) -> usize {
+    (bytes + PAGE_SIZE - 1) / PAGE_SIZE
 }
 
 // returns "conventional" memory (aka, memory below 1MB) which is accessible in 
@@ -532,18 +539,31 @@ fn adjust_config_for_physical_mirror(config: &mut Config) {
 
 }
 
-fn create_kernel_stack(pager: &mut Pager, virtual_base: VirtualAddress, size: usize) {
-    // allocate enough pages for atleast size bytes
-    let num_pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
-    let stack_size = num_pages * PAGE_SIZE;
-    let stack = get_pages(num_pages).unwrap();
-    info!("Allocated {} pages for {} byte stack at 0x{:016x}", num_pages, size, stack);
+fn create_kernel_cpu_state(pager: &mut Pager) {
+    // allocate the full per-cpu block...
+    let num_pages = page_count(PER_CPU_STATE_SIZE);
+    // The main stack is the top of that block, and is followed by exception stacks.
+    // Only the last 2 pages contain non-stack data (the GDT, and CpuState).
+    let non_stack_pages = 2;
+    let stack_pages = num_pages - non_stack_pages;
+    let stack_size = stack_pages * PAGE_SIZE;
 
-    // clear the stack with a sentinel pattern (0xa5)
-    unsafe { core::ptr::write_bytes(stack as *mut u8, 0xab, num_pages*PAGE_SIZE); }
+    let per_cpu_addr = get_pages(num_pages).unwrap();
+    info!("Allocated {} pages for bsp cpu state at 0x{:016x}", num_pages, per_cpu_addr);
 
-    // map it to virtual_base - allocated_size -> virtual_base
-    pager.map_to_virtual_many(VirtualAddress(virtual_base.0 - stack_size as Address), PhysicalAddress(stack), num_pages, 
+    // Fill all the stacks with a sentinel pattern (0xa5)
+    // TODO: ensure this is done for the APs as well..
+    let stack = per_cpu_addr + (non_stack_pages * PAGE_SIZE) as Address;
+    unsafe { core::ptr::write_bytes(stack as *mut u8, 0xa5, stack_pages*PAGE_SIZE); }
+
+    // the reset should be zero'd (TODO: check if this is already done by alloc?)
+    unsafe { core::ptr::write_bytes(per_cpu_addr as *mut u8, 0x0, non_stack_pages*PAGE_SIZE); }
+
+    // now map it all to the per-cpu location for the BSP
+    pager.map_to_virtual_many(
+        KERNEL_CPU_STATE_BASE, 
+        PhysicalAddress(per_cpu_addr), 
+        num_pages, 
         PageTableFlags::WRITABLE | PageTableFlags::GLOBAL | PageTableFlags::NO_EXECUTE).unwrap();
 }
 
@@ -727,7 +747,7 @@ fn main() -> Status {
     set_framebuffer(&mut config, &mut gop);
 
     create_physical_mirror();
-    create_kernel_stack(&mut pager, KERNEL_BSP_STACK_BASE, 1*1024*1024);
+    create_kernel_cpu_state(&mut pager); // this includes creating the stack
 
     recreate_gdt();
 
